@@ -9,7 +9,9 @@ import os
 import sqlite3
 import tempfile
 import csv
+import zipfile
 from datetime import datetime
+from xml.sax.saxutils import escape
 
 # Importa a lógica de negócio do sistema principal
 from app import parse_localizacao, DatabaseManager
@@ -252,6 +254,63 @@ class TestBuscasEFiltros(unittest.TestCase):
             conteudo = f.read()
             self.assertIn("PRATI-101", conteudo)
             self.assertIn("ENTRADA", conteudo)
+
+
+class TestCadastroGuiEImportacao(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.temp_dir.name, "test_novas_funcoes.db")
+        self.db = DatabaseManager(self.db_path)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def _criar_xlsx(caminho, linhas):
+        namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+        xml_linhas = []
+        for numero, linha in enumerate(linhas, start=1):
+            celulas = []
+            for indice, valor in enumerate(linha):
+                coluna = chr(65 + indice)
+                celulas.append(f'<c r="{coluna}{numero}" t="inlineStr"><is><t>{escape(str(valor))}</t></is></c>')
+            xml_linhas.append(f'<row r="{numero}">{"".join(celulas)}</row>')
+        planilha = f'<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="{namespace}"><sheetData>{"".join(xml_linhas)}</sheetData></worksheet>'
+        with zipfile.ZipFile(caminho, "w") as arquivo:
+            arquivo.writestr("xl/worksheets/sheet1.xml", planilha)
+
+    def test_lista_exibe_apenas_localizacoes_livres(self):
+        livres = self.db.listar_localizacoes_livres("Rua C")
+        self.assertNotIn("C2809", livres)
+        self.assertNotIn("C2810", livres)
+        self.assertIn("C2808", livres)
+        self.assertIn("C3414", livres)
+        self.assertEqual(self.db.listar_localizacoes_livres("Frações"), ["Fração"])
+
+    def test_varios_itens_compartilham_palete_de_fracoes(self):
+        self.db.cadastrar_item("Fração", "PRATI-F1", "Fracionado 1", "LF1", 2, "Normal")
+        self.db.cadastrar_item("Fração", "PRATI-F2", "Fracionado 2", "LF2", 3, "Bloqueado")
+        with self.db.get_connection() as conn:
+            rows = conn.execute("SELECT codigo_localizacao FROM itens_estoque WHERE codigo_produto IN ('PRATI-F1', 'PRATI-F2') ORDER BY codigo_produto").fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertNotEqual(rows[0][0], rows[1][0])
+        self.assertTrue(all(row[0].startswith("FRAC-") for row in rows))
+
+    def test_importacao_excel_cadastra_rua_e_fracao(self):
+        caminho = os.path.join(self.temp_dir.name, "importacao.xlsx")
+        self._criar_xlsx(caminho, [
+            ["Rua", "Localização", "Código do Produto", "Nome do Medicamento", "Lote", "Qtd.", "Status"],
+            ["Rua D", "0114", "PRATI-XLSX1", "Produto Excel", "LX1", "5", "Normal"],
+            ["Frações", "", "PRATI-XLSX2", "Produto Fracionado", "LX2", "3", "Bloqueado"],
+        ])
+        importados, erros = self.db.importar_excel(caminho)
+        self.assertEqual(importados, 2)
+        self.assertEqual(erros, [])
+        with self.db.get_connection() as conn:
+            normal = conn.execute("SELECT codigo_localizacao, status FROM itens_estoque WHERE codigo_produto = 'PRATI-XLSX1'").fetchone()
+            fracao = conn.execute("SELECT rua, status FROM itens_estoque WHERE codigo_produto = 'PRATI-XLSX2'").fetchone()
+        self.assertEqual(tuple(normal), ("D0114", "Normal"))
+        self.assertEqual(tuple(fracao), ("Frações", "Bloqueado"))
 
 
 if __name__ == "__main__":

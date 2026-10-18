@@ -7,8 +7,11 @@ import re
 import sqlite3
 import sys
 import tkinter as tk
+import unicodedata
+import zipfile
 from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
+from xml.etree import ElementTree
 
 PRIMARY = "#3F1E69"
 PRIMARY_HOVER = "#573087"
@@ -23,8 +26,69 @@ SUCCESS = "#42C58A"
 DANGER = "#FF6B7A"
 WARNING = "#F1B95B"
 
+RUAS = ("Rua A", "Rua B", "Rua C", "Rua D", "Frações")
+BLOCOS_POR_RUA = range(1, 35)
+
 BASE_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "estoque_medicamentos.db")
+
+
+def normalizar_texto(valor):
+    texto = unicodedata.normalize("NFKD", str(valor or ""))
+    return "".join(caractere for caractere in texto if not unicodedata.combining(caractere)).strip().lower()
+
+
+def eh_fracao(valor):
+    return normalizar_texto(valor).startswith("frac")
+
+
+def formatar_localizacao(codigo):
+    return "Fração" if eh_fracao(codigo) else codigo
+
+
+def _indice_coluna_excel(referencia):
+    letras = re.match(r"[A-Z]+", referencia or "A").group(0)
+    indice = 0
+    for letra in letras:
+        indice = indice * 26 + ord(letra) - 64
+    return indice - 1
+
+
+def ler_planilha_excel(caminho):
+    """Lê a primeira planilha de um arquivo XLSX usando apenas a biblioteca padrão."""
+    namespace = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    with zipfile.ZipFile(caminho) as arquivo:
+        compartilhados = []
+        if "xl/sharedStrings.xml" in arquivo.namelist():
+            raiz = ElementTree.fromstring(arquivo.read("xl/sharedStrings.xml"))
+            compartilhados = ["".join(no.text or "" for no in item.iter(f"{namespace}t")) for item in raiz]
+        planilhas = sorted(nome for nome in arquivo.namelist() if nome.startswith("xl/worksheets/sheet") and nome.endswith(".xml"))
+        if not planilhas:
+            raise ValueError("O arquivo Excel não contém planilhas.")
+        raiz = ElementTree.fromstring(arquivo.read(planilhas[0]))
+        linhas = []
+        for linha in raiz.iter(f"{namespace}row"):
+            valores = []
+            for celula in linha.findall(f"{namespace}c"):
+                indice = _indice_coluna_excel(celula.get("r", "A1"))
+                while len(valores) <= indice:
+                    valores.append("")
+                tipo = celula.get("t")
+                if tipo == "inlineStr":
+                    valor = "".join(no.text or "" for no in celula.iter(f"{namespace}t"))
+                else:
+                    no_valor = celula.find(f"{namespace}v")
+                    valor = no_valor.text if no_valor is not None else ""
+                    if tipo == "s" and valor:
+                        valor = compartilhados[int(valor)]
+                    elif valor and re.fullmatch(r"-?\d+\.0", valor):
+                        valor = valor[:-2]
+                valores[indice] = valor
+            if any(str(valor).strip() for valor in valores):
+                linhas.append(valores)
+    if not linhas:
+        raise ValueError("A planilha está vazia.")
+    return linhas
 
 
 class DatabaseManager:
@@ -157,14 +221,49 @@ class DatabaseManager:
         with self.get_connection() as connection:
             return connection.execute("SELECT * FROM itens_estoque WHERE id = ?", (item_id,)).fetchone()
 
+    def listar_localizacoes_livres(self, rua):
+        if rua == "Frações":
+            return ["Fração"]
+        if rua not in RUAS:
+            return []
+        letra = rua[-1]
+        with self.get_connection() as connection:
+            ocupadas = {
+                row[0] for row in connection.execute(
+                    "SELECT codigo_localizacao FROM itens_estoque WHERE rua = ?", (rua,)
+                )
+            }
+        return [
+            codigo
+            for bloco in BLOCOS_POR_RUA
+            for posicao in range(1, 15)
+            if (codigo := f"{letra}{bloco:02d}{posicao:02d}") not in ocupadas
+        ]
+
+    @staticmethod
+    def _proximo_codigo_fracao(cursor):
+        usados = set()
+        for row in cursor.execute("SELECT codigo_localizacao FROM itens_estoque WHERE rua = 'Frações'"):
+            match = re.search(r"(\d+)$", row[0])
+            if match:
+                usados.add(int(match.group(1)))
+        numero = 1
+        while numero in usados:
+            numero += 1
+        return f"FRAC-{numero:02d}", numero
+
     def cadastrar_item(self, localizacao, codigo, nome, lote, quantidade, status):
-        endereco = parse_localizacao(localizacao)
-        if not endereco["valido"]:
-            raise ValueError(endereco["msg"])
         dados = self._validar_campos(codigo, nome, lote, quantidade, status)
-        item = (endereco["rua"], endereco["bloco"], endereco["posicao"], endereco["codigo"], *dados[:4])
+        fracao = eh_fracao(localizacao)
+        endereco = None if fracao else parse_localizacao(localizacao)
+        if endereco is not None and not endereco["valido"]:
+            raise ValueError(endereco["msg"])
         with self.get_connection() as connection:
             cursor = connection.cursor()
+            if fracao:
+                codigo_fracao, posicao = self._proximo_codigo_fracao(cursor)
+                endereco = {"rua": "Frações", "bloco": 0, "posicao": posicao, "codigo": codigo_fracao}
+            item = (endereco["rua"], endereco["bloco"], endereco["posicao"], endereco["codigo"], *dados[:4])
             cursor.execute("""
                 INSERT INTO itens_estoque
                     (rua, bloco, posicao, codigo_localizacao, codigo_produto,
@@ -172,6 +271,52 @@ class DatabaseManager:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (*item, dados[4]))
             self._registrar_historico(cursor, "ENTRADA", item, "Cadastro de novo item")
+
+    def importar_excel(self, caminho):
+        linhas = ler_planilha_excel(caminho)
+        cabecalhos = {
+            re.sub(r"[^a-z0-9]+", "_", normalizar_texto(valor)).strip("_"): indice
+            for indice, valor in enumerate(linhas[0])
+        }
+        aliases = {
+            "rua": ("rua",),
+            "localizacao": ("localizacao", "codigo_localizacao", "codigo_da_localizacao", "endereco", "posicao"),
+            "codigo": ("codigo", "codigo_produto", "codigo_do_produto", "cod_produto"),
+            "nome": ("medicamento", "nome", "nome_medicamento", "nome_do_medicamento", "produto"),
+            "lote": ("lote",),
+            "quantidade": ("quantidade", "qtd", "estoque"),
+            "status": ("status", "situacao"),
+        }
+
+        def indice_de(campo):
+            return next((cabecalhos[nome] for nome in aliases[campo] if nome in cabecalhos), None)
+
+        indices = {campo: indice_de(campo) for campo in aliases}
+        faltantes = [campo for campo in ("codigo", "nome", "lote", "quantidade") if indices[campo] is None]
+        if faltantes or (indices["localizacao"] is None and indices["rua"] is None):
+            nomes = ", ".join(faltantes + (["localização ou rua"] if indices["localizacao"] is None and indices["rua"] is None else []))
+            raise ValueError(f"Colunas obrigatórias ausentes: {nomes}.")
+
+        importados, erros = 0, []
+        for numero_linha, linha in enumerate(linhas[1:], start=2):
+            def valor(campo, padrao=""):
+                indice = indices[campo]
+                return str(linha[indice]).strip() if indice is not None and indice < len(linha) else padrao
+
+            if not any(str(celula).strip() for celula in linha):
+                continue
+            rua, localizacao = valor("rua"), valor("localizacao")
+            if eh_fracao(rua) or eh_fracao(localizacao):
+                localizacao = "Fração"
+            elif localizacao.isdigit() and normalizar_texto(rua) in ("rua a", "rua b", "rua c", "rua d"):
+                localizacao = f"{rua.strip()[-1].upper()}{localizacao.zfill(4)}"
+            status = "Bloqueado" if normalizar_texto(valor("status", "Normal")) == "bloqueado" else "Normal"
+            try:
+                self.cadastrar_item(localizacao, valor("codigo"), valor("nome"), valor("lote"), valor("quantidade"), status)
+                importados += 1
+            except (ValueError, sqlite3.Error) as error:
+                erros.append(f"Linha {numero_linha}: {error}")
+        return importados, erros
 
     def atualizar_item(self, item_id, localizacao, codigo, nome, lote, quantidade, status, motivo):
         endereco = parse_localizacao(localizacao)
@@ -337,6 +482,17 @@ class InicioView(BaseView):
         super().__init__(parent, app)
         self.metric_labels = {}
         self.cabecalho("Visão geral", "Acompanhe o estoque e as últimas movimentações.")
+        destaque = tk.Frame(self, bg=PRIMARY)
+        destaque.pack(fill="x", padx=34, pady=(0, 18))
+        chamada = tk.Frame(destaque, bg=PRIMARY)
+        chamada.pack(side="left", fill="both", expand=True, padx=24, pady=18)
+        tk.Label(chamada, text="O que você deseja fazer?", bg=PRIMARY, fg=TEXT, font=("Segoe UI Semibold", 16)).pack(anchor="w")
+        tk.Label(chamada, text="Cadastre um item ou encontre rapidamente o que precisa.", bg=PRIMARY, fg="#DCCDEB", font=("Segoe UI", 9)).pack(anchor="w", pady=(4, 0))
+        atalhos = tk.Frame(destaque, bg=PRIMARY)
+        atalhos.pack(side="right", padx=20, pady=16)
+        criar_botao(atalhos, "+ Novo cadastro", lambda: self.app.mostrar_pagina("cadastrar"), "secondary").pack(side="left", padx=5)
+        criar_botao(atalhos, "Importar Excel", self._abrir_importacao, "secondary").pack(side="left", padx=5)
+        criar_botao(atalhos, "Consultar estoque", lambda: self.app.mostrar_pagina("consultar"), "secondary").pack(side="left", padx=5)
         metricas = tk.Frame(self, bg=BG)
         metricas.pack(fill="x", padx=34)
         for indice, (chave, titulo, cor) in enumerate((
@@ -344,9 +500,10 @@ class InicioView(BaseView):
             ("unidades", "Unidades em estoque", SUCCESS),
             ("bloqueados", "Itens bloqueados", WARNING),
         )):
-            card = tk.Frame(metricas, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
+            card = tk.Frame(metricas, bg=SURFACE)
             card.grid(row=0, column=indice, sticky="nsew", padx=(0, 12 if indice < 2 else 0))
             metricas.grid_columnconfigure(indice, weight=1)
+            tk.Frame(card, bg=cor, height=3).pack(fill="x")
             tk.Label(card, text=titulo, bg=SURFACE, fg=MUTED, font=("Segoe UI", 10)).pack(anchor="w", padx=20, pady=(18, 6))
             label = tk.Label(card, text="—", bg=SURFACE, fg=cor, font=("Segoe UI Semibold", 28))
             label.pack(anchor="w", padx=20, pady=(0, 18))
@@ -374,7 +531,11 @@ class InicioView(BaseView):
         self.metric_labels["bloqueados"].configure(text=str(bloqueados))
         self.tabela.delete(*self.tabela.get_children())
         for row in self.app.db.listar_historico(limite=8):
-            self.tabela.insert("", "end", values=(row["data_hora"], row["tipo"], row["codigo_localizacao"], row["codigo_produto"], row["nome_medicamento"], row["quantidade"]))
+            self.tabela.insert("", "end", values=(row["data_hora"], row["tipo"], formatar_localizacao(row["codigo_localizacao"]), row["codigo_produto"], row["nome_medicamento"], row["quantidade"]))
+
+    def _abrir_importacao(self):
+        self.app.mostrar_pagina("cadastrar")
+        self.app.paginas["cadastrar"].importar_excel()
 
 
 class ConsultarView(BaseView):
@@ -432,7 +593,7 @@ class ConsultarView(BaseView):
         for row in rows:
             tag = "bloqueado" if row["status"] == "Bloqueado" else ""
             self.tabela.insert("", "end", iid=str(row["id"]), values=(
-                row["codigo_localizacao"], row["codigo_produto"], row["nome_medicamento"],
+                formatar_localizacao(row["codigo_localizacao"]), row["codigo_produto"], row["nome_medicamento"],
                 row["lote"], row["quantidade"], row["status"], "Editar     |     Remover",
             ), tags=(tag,))
         self.contagem.set(f"{len(rows)} item" + ("" if len(rows) == 1 else "s"))
@@ -473,31 +634,48 @@ class CadastrarView(BaseView):
     def __init__(self, parent, app):
         super().__init__(parent, app)
         self.campos = {}
+        self.rua = tk.StringVar(value="Rua A")
+        self.localizacao = tk.StringVar()
         self.status = tk.StringVar(value="Normal")
-        self.previa = tk.StringVar(value="Informe um endereço, como C2809 ou FRAC-01.")
+        self.previa = tk.StringVar(value="Selecione uma rua e uma localização disponível.")
         self.cabecalho("Cadastrar item", "Inclua um novo medicamento em uma posição livre do estoque.")
         card = tk.Frame(self, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
         card.pack(fill="both", expand=True, padx=34, pady=(0, 28))
         form = tk.Frame(card, bg=SURFACE)
         form.pack(fill="x", padx=34, pady=28)
+
+        bloco_rua = tk.Frame(form, bg=SURFACE)
+        bloco_rua.grid(row=0, column=0, sticky="ew", padx=(0, 22), pady=(0, 18))
+        form.grid_columnconfigure(0, weight=1)
+        tk.Label(bloco_rua, text="Rua", bg=SURFACE, fg=MUTED, font=("Segoe UI Semibold", 9)).pack(anchor="w", pady=(0, 7))
+        self.rua_combo = ttk.Combobox(bloco_rua, textvariable=self.rua, values=RUAS, state="readonly")
+        self.rua_combo.pack(fill="x")
+        self.rua_combo.bind("<<ComboboxSelected>>", self._atualizar_localizacoes)
+
+        bloco_local = tk.Frame(form, bg=SURFACE)
+        bloco_local.grid(row=0, column=1, sticky="ew", pady=(0, 18))
+        form.grid_columnconfigure(1, weight=1)
+        tk.Label(bloco_local, text="Localização livre", bg=SURFACE, fg=MUTED, font=("Segoe UI Semibold", 9)).pack(anchor="w", pady=(0, 7))
+        self.localizacao_combo = ttk.Combobox(bloco_local, textvariable=self.localizacao, state="readonly")
+        self.localizacao_combo.pack(fill="x")
+        self.localizacao_combo.bind("<<ComboboxSelected>>", self._atualizar_previa)
+
         campos = (
-            ("localizacao", "Localização"), ("codigo", "Código do produto"),
-            ("nome", "Medicamento"), ("lote", "Lote"), ("quantidade", "Quantidade"),
+            ("codigo", "Código do produto"), ("nome", "Medicamento"),
+            ("lote", "Lote"), ("quantidade", "Quantidade"),
         )
         for indice, (chave, rotulo) in enumerate(campos):
             linha, coluna = divmod(indice, 2)
+            linha += 1
             bloco = tk.Frame(form, bg=SURFACE)
             bloco.grid(row=linha, column=coluna, sticky="ew", padx=(0, 22 if coluna == 0 else 0), pady=(0, 18))
-            form.grid_columnconfigure(coluna, weight=1)
             tk.Label(bloco, text=rotulo, bg=SURFACE, fg=MUTED, font=("Segoe UI Semibold", 9)).pack(anchor="w", pady=(0, 7))
             entrada = tk.Entry(bloco, bg=SURFACE_ALT, fg=TEXT, insertbackground=TEXT, relief="flat", font=("Segoe UI", 11), highlightbackground=BORDER, highlightthickness=1)
             entrada.pack(fill="x", ipady=10)
             self.campos[chave] = entrada
-            if chave == "localizacao":
-                entrada.bind("<KeyRelease>", self._atualizar_previa)
 
         bloco_status = tk.Frame(form, bg=SURFACE)
-        bloco_status.grid(row=2, column=1, sticky="ew", pady=(0, 18))
+        bloco_status.grid(row=3, column=0, sticky="ew", padx=(0, 22), pady=(0, 18))
         tk.Label(bloco_status, text="Status", bg=SURFACE, fg=MUTED, font=("Segoe UI Semibold", 9)).pack(anchor="w", pady=(0, 7))
         ttk.Combobox(bloco_status, textvariable=self.status, values=("Normal", "Bloqueado"), state="readonly").pack(fill="x")
         previa = tk.Frame(card, bg=SURFACE_ALT, highlightbackground=BORDER, highlightthickness=1)
@@ -507,18 +685,37 @@ class CadastrarView(BaseView):
         self.previa_label.pack(anchor="w", padx=16, pady=(0, 12))
         acoes = tk.Frame(card, bg=SURFACE)
         acoes.pack(fill="x", padx=34, pady=(0, 28))
+        criar_botao(acoes, "Importar Excel", self.importar_excel, "secondary").pack(side="left")
         criar_botao(acoes, "Limpar", self.limpar, "secondary").pack(side="right")
         criar_botao(acoes, "Cadastrar item", self.salvar).pack(side="right", padx=(0, 10))
+        self._atualizar_localizacoes()
 
     def _atualizar_previa(self, _event=None):
-        resultado = parse_localizacao(self.campos["localizacao"].get())
-        self.previa.set(resultado.get("descricao", resultado.get("msg")))
-        self.previa_label.configure(fg=SUCCESS if resultado["valido"] else DANGER)
+        localizacao = self.localizacao.get()
+        if not localizacao:
+            self.previa.set("Não há localizações livres nesta rua.")
+            self.previa_label.configure(fg=WARNING)
+            return
+        if localizacao == "Fração":
+            self.previa.set("Palete de Frações • vários itens podem compartilhar este local")
+        else:
+            self.previa.set(parse_localizacao(localizacao)["descricao"])
+        self.previa_label.configure(fg=SUCCESS)
+
+    def _atualizar_localizacoes(self, _event=None):
+        livres = self.app.db.listar_localizacoes_livres(self.rua.get())
+        self.localizacao_combo.configure(values=livres)
+        self.localizacao.set(livres[0] if livres else "")
+        self._atualizar_previa()
+
+    def on_show(self):
+        if hasattr(self, "localizacao_combo"):
+            self._atualizar_localizacoes()
 
     def salvar(self):
         try:
             self.app.db.cadastrar_item(
-                self.campos["localizacao"].get(), self.campos["codigo"].get(),
+                self.localizacao.get(), self.campos["codigo"].get(),
                 self.campos["nome"].get(), self.campos["lote"].get(),
                 self.campos["quantidade"].get(), self.status.get(),
             )
@@ -536,10 +733,32 @@ class CadastrarView(BaseView):
     def limpar(self):
         for entrada in self.campos.values():
             entrada.delete(0, "end")
+        self.rua.set("Rua A")
         self.status.set("Normal")
-        self.previa.set("Informe um endereço, como C2809 ou FRAC-01.")
-        self.previa_label.configure(fg=MUTED)
-        self.campos["localizacao"].focus_set()
+        self._atualizar_localizacoes()
+        self.campos["codigo"].focus_set()
+
+    def importar_excel(self):
+        caminho = filedialog.askopenfilename(
+            parent=self, title="Importar itens do Excel",
+            filetypes=(("Planilha Excel", "*.xlsx"),),
+        )
+        if not caminho:
+            return
+        try:
+            importados, erros = self.app.db.importar_excel(caminho)
+        except (ValueError, OSError, zipfile.BadZipFile) as error:
+            messagebox.showerror("Importação não realizada", str(error), parent=self)
+            return
+        self.app.atualizar_todas()
+        if erros:
+            detalhes = "\n".join(erros[:8])
+            restante = f"\n... e mais {len(erros) - 8} erro(s)." if len(erros) > 8 else ""
+            messagebox.showwarning("Importação concluída com ressalvas", f"{importados} item(ns) importado(s).\n{len(erros)} linha(s) ignorada(s).\n\n{detalhes}{restante}", parent=self)
+        else:
+            messagebox.showinfo("Importação concluída", f"{importados} item(ns) importado(s) com sucesso.", parent=self)
+        if importados:
+            self.app.mostrar_pagina("consultar")
 
 
 class HistoricoView(BaseView):
@@ -593,7 +812,7 @@ class HistoricoView(BaseView):
             return
         self.tabela.delete(*self.tabela.get_children())
         for row in self.app.db.listar_historico(self.busca.get(), self.tipo.get()):
-            self.tabela.insert("", "end", values=(row["data_hora"], row["tipo"], row["codigo_localizacao"], row["codigo_produto"], row["nome_medicamento"], row["lote"], row["quantidade"], row["motivo"]))
+            self.tabela.insert("", "end", values=(row["data_hora"], row["tipo"], formatar_localizacao(row["codigo_localizacao"]), row["codigo_produto"], row["nome_medicamento"], row["lote"], row["quantidade"], row["motivo"]))
 
     def exportar(self):
         caminho = filedialog.asksaveasfilename(
