@@ -1,0 +1,30 @@
+PRATI WMS - COMO USAR EM OUTRO COMPUTADOR
+
+1. Copie a pasta Prati_WMS_Portatil inteira para o pendrive.
+2. No outro computador, copie a pasta inteira do pendrive para Documentos.
+3. Não coloque o programa dentro de Program Files.
+4. Abra a pasta e dê dois cliques em Prati_WMS.exe.
+5. Não é necessário instalar Python e nem executar como administrador.
+6. Se o Windows mostrar uma tela de proteção, clique em Mais informações e depois em Executar assim mesmo, desde que o arquivo seja esta cópia criada por você.
+7. Mantenha Prati_WMS.exe e estoque_medicamentos.db sempre na mesma pasta.
+
+BACKUPS
+
+- O programa cria um backup por dia dentro da pasta Backups.
+- São mantidos os 7 backups automáticos mais recentes.
+- Também é possível clicar em Fazer backup na tela Início.
+- Para levar os dados de volta, feche o programa e copie a pasta inteira.
+
+IMPRESSORA
+
+1. Instale a impressora normalmente pelo Windows. A instalação do driver pode pedir a senha de administrador.
+2. Faça uma página de teste pelo próprio Windows.
+3. Configure o papel como 6 x 4 polegadas, horizontal. Em Zebra, use 203 dpi quando disponível.
+4. Abra a aba Etiquetas no Prati WMS.
+5. Atualize a lista, selecione a impressora e faça primeiro uma impressão de teste.
+
+IMPORTANTE
+
+- Feche o programa antes de retirar o pendrive ou copiar o banco.
+- Para uso diário, trabalhe com a pasta copiada em Documentos, e não diretamente no pendrive.
+- Esta versão começa com o estoque vazio.

@@ -10,11 +10,23 @@ import sqlite3
 import tempfile
 import csv
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from xml.sax.saxutils import escape
 
+from PIL import Image
+
 # Importa a lógica de negócio do sistema principal
-from app import parse_localizacao, DatabaseManager
+from app import (
+    LABEL_HEIGHT_PX,
+    LABEL_WIDTH_PX,
+    DatabaseManager,
+    abrir_modelo_etiqueta,
+    imprimir_imagem_windows,
+    listar_impressoras,
+    parse_localizacao,
+    renderizar_etiqueta,
+    salvar_modelo_etiqueta,
+)
 
 
 class TestEnderecamento2D(unittest.TestCase):
@@ -86,32 +98,21 @@ class TestBancoDadosEAuditoria(unittest.TestCase):
         """Limpa o ambiente temporário."""
         self.temp_dir.cleanup()
 
-    def test_criacao_e_seed_inicial(self):
-        """Verifica se tabelas, índices e carga inicial de demonstração são gerados."""
+    def test_criacao_banco_vazio(self):
+        """Verifica se um banco novo começa vazio e com a estrutura necessária."""
         with self.db.get_connection() as conn:
             c = conn.cursor()
             c.execute("SELECT COUNT(*) FROM itens_estoque")
             total_itens = c.fetchone()[0]
-            self.assertGreater(total_itens, 0, "O banco deve conter dados iniciais.")
+            self.assertEqual(total_itens, 0)
 
             c.execute("SELECT COUNT(*) FROM historico_movimentacoes")
             total_logs = c.fetchone()[0]
-            self.assertEqual(total_itens, total_logs, "Cada item inicial deve ter um registro de ENTRADA no log.")
+            self.assertEqual(total_logs, 0)
 
     def test_cadastro_item_com_log_auditoria(self):
         """Cadastra um novo medicamento e valida o registro correspondente no log."""
-        agora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-        with self.db.get_connection() as conn:
-            c = conn.cursor()
-            c.execute("""
-                INSERT INTO itens_estoque (rua, bloco, posicao, codigo_localizacao, codigo_produto, nome_medicamento, lote, quantidade)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, ("Rua A", 8, 12, "A0812", "PRATI-999", "Cetoprofeno 100mg", "L26001A", 50))
-
-            c.execute("""
-                INSERT INTO historico_movimentacoes (data_hora, tipo, codigo_localizacao, codigo_produto, nome_medicamento, lote, quantidade, motivo)
-                VALUES (?, 'ENTRADA', ?, ?, ?, ?, ?, 'Cadastro de novo lote')
-            """, (agora, "A0812", "PRATI-999", "Cetoprofeno 100mg", "L26001A", 50))
+        self.db.cadastrar_item("A0812", "PRATI-999", "Cetoprofeno 100mg", "L26001A", 50, "Normal")
 
         # Validação da persistência
         with self.db.get_connection() as conn:
@@ -132,6 +133,7 @@ class TestBancoDadosEAuditoria(unittest.TestCase):
 
     def test_impedir_duplicidade_de_localizacao(self):
         """Garante que a mesma posição física não pode ser cadastrada simultaneamente por outro item."""
+        self.db.cadastrar_item("C2809", "PRATI-BASE", "Medicamento base", "LBASE", 1, "Normal")
         with self.db.get_connection() as conn:
             c = conn.cursor()
             with self.assertRaises(sqlite3.IntegrityError):
@@ -152,14 +154,12 @@ class TestBancoDadosEAuditoria(unittest.TestCase):
 
     def test_alteracao_item_e_log(self):
         """Edita dados de um item existente e registra no log."""
-        agora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-        with self.db.get_connection() as conn:
-            c = conn.cursor()
-            c.execute("UPDATE itens_estoque SET quantidade = 250 WHERE codigo_localizacao = 'C2809'")
-            c.execute("""
-                INSERT INTO historico_movimentacoes (data_hora, tipo, codigo_localizacao, codigo_produto, nome_medicamento, lote, quantidade, motivo)
-                VALUES (?, 'ALTERAÇÃO', 'C2809', 'PRATI-101', 'Dipirona 500mg/mL Gotas', 'L24089A', 250, 'Qtd alterada de 140 para 250')
-            """, (agora,))
+        self.db.cadastrar_item("C2809", "PRATI-101", "Dipirona 500mg/mL Gotas", "L24089A", 140, "Normal")
+        item = self.db.listar_itens("PRATI-101")[0]
+        self.db.atualizar_item(
+            item["id"], "C2809", "PRATI-101", "Dipirona 500mg/mL Gotas",
+            "L24089A", 250, "Normal", "Qtd alterada de 140 para 250",
+        )
 
         with self.db.get_connection() as conn:
             c = conn.cursor()
@@ -173,21 +173,9 @@ class TestBancoDadosEAuditoria(unittest.TestCase):
 
     def test_baixa_remocao_item_e_log(self):
         """Dá baixa total em um medicamento e valida a desocupação da posição e registro de auditoria."""
-        agora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-        with self.db.get_connection() as conn:
-            c = conn.cursor()
-            # Pega dados antes de remover
-            c.execute("SELECT codigo_produto, nome_medicamento, lote, quantidade FROM itens_estoque WHERE codigo_localizacao = 'A0201'")
-            item = c.fetchone()
-
-            # Remove da tabela principal
-            c.execute("DELETE FROM itens_estoque WHERE codigo_localizacao = 'A0201'")
-
-            # Registra baixa no log
-            c.execute("""
-                INSERT INTO historico_movimentacoes (data_hora, tipo, codigo_localizacao, codigo_produto, nome_medicamento, lote, quantidade, motivo)
-                VALUES (?, 'BAIXA / REMOÇÃO', 'A0201', ?, ?, ?, ?, 'Saída por expedição')
-            """, (agora, item[0], item[1], item[2], item[3]))
+        self.db.cadastrar_item("A0201", "PRATI-201", "Omeprazol 20mg", "L24011D", 220, "Normal")
+        item = self.db.listar_itens("PRATI-201")[0]
+        self.db.remover_item(item["id"])
 
         with self.db.get_connection() as conn:
             c = conn.cursor()
@@ -209,6 +197,8 @@ class TestBuscasEFiltros(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self.temp_dir.name, "test_buscas.db")
         self.db = DatabaseManager(self.db_path)
+        self.db.cadastrar_item("C2809", "PRATI-101", "Dipirona 500mg/mL Gotas", "L24089A", 140, "Normal")
+        self.db.cadastrar_item("C2810", "PRATI-102", "Paracetamol 750mg", "L24090B", 85, "Normal")
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -261,6 +251,8 @@ class TestCadastroGuiEImportacao(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self.temp_dir.name, "test_novas_funcoes.db")
         self.db = DatabaseManager(self.db_path)
+        self.db.cadastrar_item("C2809", "PRATI-101", "Dipirona", "L1", 10, "Normal")
+        self.db.cadastrar_item("C2810", "PRATI-102", "Paracetamol", "L2", 10, "Normal")
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -311,6 +303,133 @@ class TestCadastroGuiEImportacao(unittest.TestCase):
             fracao = conn.execute("SELECT rua, status FROM itens_estoque WHERE codigo_produto = 'PRATI-XLSX2'").fetchone()
         self.assertEqual(tuple(normal), ("D0114", "Normal"))
         self.assertEqual(tuple(fracao), ("Frações", "Bloqueado"))
+
+
+class TestManutencaoBanco(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.temp_dir.name, "test_manutencao.db")
+        self.db = DatabaseManager(self.db_path, manutencao_automatica=False)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_limpeza_mantem_somente_ultimas_48_horas(self):
+        referencia = datetime(2026, 10, 18, 12, 0, 0)
+        antigo = (referencia - timedelta(days=3)).strftime("%d/%m/%Y %H:%M:%S")
+        recente = (referencia - timedelta(hours=47)).strftime("%d/%m/%Y %H:%M:%S")
+        with self.db.get_connection() as connection:
+            for data_hora, codigo in ((antigo, "ANTIGO"), (recente, "RECENTE")):
+                connection.execute(
+                    """
+                    INSERT INTO historico_movimentacoes
+                        (data_hora, tipo, codigo_localizacao, codigo_produto,
+                         nome_medicamento, lote, quantidade, motivo)
+                    VALUES (?, 'ENTRADA', 'A0101', ?, 'Teste', 'L1', 1, 'Retenção')
+                    """,
+                    (data_hora, codigo),
+                )
+
+        removidos = self.db.limpar_historico_antigo(referencia)
+
+        with self.db.get_connection() as connection:
+            codigos = {
+                row[0] for row in connection.execute(
+                    "SELECT codigo_produto FROM historico_movimentacoes"
+                )
+            }
+        self.assertEqual(removidos, 1)
+        self.assertEqual(codigos, {"RECENTE"})
+
+    def test_backup_integro_e_retencao_de_sete_copias(self):
+        self.db.cadastrar_item("A0101", "PRATI-BKP", "Produto backup", "LBKP", 4, "Normal")
+        manual = os.path.join(self.temp_dir.name, "manual.db")
+        self.db.criar_backup(manual)
+        connection = sqlite3.connect(manual)
+        try:
+            self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM itens_estoque").fetchone()[0], 1)
+        finally:
+            connection.close()
+
+        for dia in range(1, 10):
+            self.db.criar_backup_automatico(datetime(2026, 1, dia, 8, 0, 0))
+        automaticos = sorted(
+            nome for nome in os.listdir(self.db.backup_dir)
+            if nome.startswith("Prati_WMS_auto_")
+        )
+        self.assertEqual(len(automaticos), 7)
+        self.assertEqual(automaticos[0], "Prati_WMS_auto_2026-01-03.db")
+
+
+class TestEtiquetasZebra(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def _elementos():
+        return [
+            {"tipo": "texto", "x": 406, "y": 160, "texto": "PRATI WMS", "tamanho": 28},
+            {"tipo": "imagem", "x": 406, "y": 650, "largura": 160, "altura": 120, "imagem": Image.new("RGBA", (80, 60), "black")},
+        ]
+
+    def test_renderizacao_zebra_sample_203_dpi(self):
+        etiqueta = renderizar_etiqueta(self._elementos())
+        self.assertEqual(etiqueta.size, (LABEL_WIDTH_PX, LABEL_HEIGHT_PX))
+        self.assertEqual(etiqueta.size, (1218, 812))
+        self.assertGreater(etiqueta.width, etiqueta.height)
+        self.assertEqual(etiqueta.getpixel((406, 650)), (0, 0, 0))
+        self.assertNotEqual(etiqueta.getbbox(), None)
+
+    def test_modelo_preserva_texto_e_imagem(self):
+        caminho = os.path.join(self.temp_dir.name, "modelo.prati-etiqueta")
+        salvar_modelo_etiqueta(caminho, self._elementos())
+        elementos = abrir_modelo_etiqueta(caminho)
+        self.assertEqual(elementos[0]["texto"], "PRATI WMS")
+        self.assertEqual(elementos[0]["tamanho"], 28)
+        self.assertEqual(elementos[1]["imagem"].size, (80, 60))
+
+    def test_descoberta_de_impressoras_sem_hardware(self):
+        class ImpressorasFalsas:
+            PRINTER_ENUM_LOCAL = 2
+            PRINTER_ENUM_CONNECTIONS = 4
+
+            @staticmethod
+            def EnumPrinters(flags):
+                self.assertEqual(flags, 6)
+                return [(None, None, "Zebra Teste"), (None, None, "Impressora PDF")]
+
+        self.assertEqual(listar_impressoras(ImpressorasFalsas), ["Impressora PDF", "Zebra Teste"])
+
+    def test_envio_para_driver_simulado(self):
+        eventos = []
+
+        class DCFalso:
+            def CreatePrinterDC(self, nome): eventos.append(("printer", nome))
+            def GetDeviceCaps(self, codigo): return {8: 1200, 10: 1600, 88: 203, 90: 203}[codigo]
+            def StartDoc(self, nome): eventos.append(("documento", nome))
+            def StartPage(self): eventos.append(("pagina", "inicio"))
+            def GetHandleOutput(self): return 123
+            def EndPage(self): eventos.append(("pagina", "fim"))
+            def EndDoc(self): eventos.append(("documento", "fim"))
+            def AbortDoc(self): eventos.append(("documento", "abortado"))
+            def DeleteDC(self): eventos.append(("dc", "excluido"))
+
+        class DIBFalso:
+            def __init__(self, imagem): self.imagem = imagem
+            def draw(self, handle, caixa): eventos.append(("desenho", handle, caixa, self.imagem.size))
+
+        imprimir_imagem_windows(
+            renderizar_etiqueta(self._elementos()), "Zebra Teste",
+            criar_dc=DCFalso, criar_dib=DIBFalso,
+        )
+        self.assertIn(("printer", "Zebra Teste"), eventos)
+        self.assertTrue(any(evento[0] == "desenho" for evento in eventos))
+        self.assertIn(("documento", "fim"), eventos)
+        self.assertIn(("dc", "excluido"), eventos)
 
 
 if __name__ == "__main__":

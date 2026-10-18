@@ -2,6 +2,10 @@
 
 import contextlib
 import csv
+import base64
+import io
+import json
+import math
 import os
 import re
 import sqlite3
@@ -9,9 +13,14 @@ import sys
 import tkinter as tk
 import unicodedata
 import zipfile
-from datetime import datetime
-from tkinter import filedialog, messagebox, ttk
+from datetime import datetime, timedelta
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from xml.etree import ElementTree
+
+import win32con
+import win32print
+import win32ui
+from PIL import Image, ImageDraw, ImageFont, ImageGrab, ImageTk, ImageWin
 
 PRIMARY = "#3F1E69"
 PRIMARY_HOVER = "#573087"
@@ -29,8 +38,17 @@ WARNING = "#F1B95B"
 RUAS = ("Rua A", "Rua B", "Rua C", "Rua D", "Frações")
 BLOCOS_POR_RUA = range(1, 35)
 
+LABEL_WIDTH_IN = 6
+LABEL_HEIGHT_IN = 4
+LABEL_DPI = 203
+LABEL_WIDTH_PX = LABEL_WIDTH_IN * LABEL_DPI
+LABEL_HEIGHT_PX = LABEL_HEIGHT_IN * LABEL_DPI
+ARIAL_BLACK_PATH = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "ariblk.ttf")
+
 BASE_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "estoque_medicamentos.db")
+HISTORY_RETENTION_DAYS = 2
+BACKUP_RETENTION = 7
 
 
 def normalizar_texto(valor):
@@ -91,16 +109,132 @@ def ler_planilha_excel(caminho):
     return linhas
 
 
+def fonte_arial_black(tamanho_pontos):
+    tamanho_pixels = max(8, round(float(tamanho_pontos) * LABEL_DPI / 72))
+    if not os.path.exists(ARIAL_BLACK_PATH):
+        raise RuntimeError("A fonte Arial Black não foi encontrada no Windows.")
+    return ImageFont.truetype(ARIAL_BLACK_PATH, tamanho_pixels)
+
+
+def renderizar_etiqueta(elementos):
+    """Renderiza uma etiqueta Zebra SAMPLE horizontal 6x4 em 203 dpi."""
+    etiqueta = Image.new("RGB", (LABEL_WIDTH_PX, LABEL_HEIGHT_PX), "white")
+    desenho = ImageDraw.Draw(etiqueta)
+    for elemento in elementos:
+        if elemento["tipo"] == "texto":
+            desenho.text(
+                (int(elemento["x"]), int(elemento["y"])),
+                elemento["texto"], fill="black",
+                font=fonte_arial_black(elemento["tamanho"]), anchor="mm",
+            )
+        elif elemento["tipo"] == "imagem":
+            imagem = elemento["imagem"].convert("RGBA")
+            largura = max(1, int(elemento["largura"]))
+            altura = max(1, int(elemento["altura"]))
+            imagem = imagem.resize((largura, altura), Image.Resampling.LANCZOS)
+            x = int(elemento["x"] - largura / 2)
+            y = int(elemento["y"] - altura / 2)
+            etiqueta.paste(imagem, (x, y), imagem)
+    return etiqueta
+
+
+def salvar_modelo_etiqueta(caminho, elementos):
+    dados = {"formato": "Prati WMS Zebra SAMPLE horizontal", "largura": LABEL_WIDTH_PX, "altura": LABEL_HEIGHT_PX, "elementos": []}
+    for elemento in elementos:
+        item = {chave: valor for chave, valor in elemento.items() if chave != "imagem"}
+        if elemento["tipo"] == "imagem":
+            buffer = io.BytesIO()
+            elemento["imagem"].save(buffer, format="PNG")
+            item["imagem_png"] = base64.b64encode(buffer.getvalue()).decode("ascii")
+        dados["elementos"].append(item)
+    with open(caminho, "w", encoding="utf-8") as arquivo:
+        json.dump(dados, arquivo, ensure_ascii=False, indent=2)
+
+
+def abrir_modelo_etiqueta(caminho):
+    with open(caminho, "r", encoding="utf-8") as arquivo:
+        dados = json.load(arquivo)
+    if dados.get("largura") != LABEL_WIDTH_PX or dados.get("altura") != LABEL_HEIGHT_PX:
+        raise ValueError("O modelo não usa o formato Zebra SAMPLE horizontal 6x4 em 203 dpi.")
+    elementos = []
+    for item in dados.get("elementos", []):
+        tipo = item.get("tipo")
+        if tipo not in ("texto", "imagem"):
+            raise ValueError("O modelo contém um elemento não suportado.")
+        elemento = {chave: valor for chave, valor in item.items() if chave != "imagem_png"}
+        if tipo == "imagem":
+            conteudo = base64.b64decode(item["imagem_png"])
+            elemento["imagem"] = Image.open(io.BytesIO(conteudo)).convert("RGBA")
+        elementos.append(elemento)
+    return elementos
+
+
+def listar_impressoras(modulo=win32print):
+    flags = modulo.PRINTER_ENUM_LOCAL | modulo.PRINTER_ENUM_CONNECTIONS
+    return sorted({item[2] for item in modulo.EnumPrinters(flags)}, key=str.casefold)
+
+
+def imprimir_imagem_windows(imagem, impressora, criar_dc=win32ui.CreateDC, criar_dib=ImageWin.Dib):
+    """Envia a etiqueta como bitmap para qualquer impressora instalada no Windows."""
+    if not impressora:
+        raise ValueError("Selecione uma impressora.")
+    dc = criar_dc()
+    documento_iniciado = False
+    try:
+        dc.CreatePrinterDC(impressora)
+        largura_area = dc.GetDeviceCaps(win32con.HORZRES)
+        altura_area = dc.GetDeviceCaps(win32con.VERTRES)
+        dpi_x = dc.GetDeviceCaps(win32con.LOGPIXELSX)
+        dpi_y = dc.GetDeviceCaps(win32con.LOGPIXELSY)
+        largura_alvo = round(LABEL_WIDTH_IN * dpi_x)
+        altura_alvo = round(LABEL_HEIGHT_IN * dpi_y)
+        escala = min(1.0, largura_area / largura_alvo, altura_area / altura_alvo)
+        largura_alvo = max(1, round(largura_alvo * escala))
+        altura_alvo = max(1, round(altura_alvo * escala))
+        x = max(0, (largura_area - largura_alvo) // 2)
+        y = max(0, (altura_area - altura_alvo) // 2)
+        dc.StartDoc("Prati WMS - Etiqueta Zebra SAMPLE")
+        documento_iniciado = True
+        dc.StartPage()
+        criar_dib(imagem.convert("RGB")).draw(dc.GetHandleOutput(), (x, y, x + largura_alvo, y + altura_alvo))
+        dc.EndPage()
+        dc.EndDoc()
+        documento_iniciado = False
+    except Exception:
+        if documento_iniciado:
+            dc.AbortDoc()
+        raise
+    finally:
+        dc.DeleteDC()
+
+
 class DatabaseManager:
     """Gerencia o banco local e mantém o histórico das operações."""
 
-    def __init__(self, db_path=DB_PATH):
-        self.db_path = db_path
+    def __init__(self, db_path=DB_PATH, manutencao_automatica=True):
+        self.db_path = os.path.abspath(db_path)
+        self.base_dir = os.path.dirname(self.db_path)
+        self.backup_dir = os.path.join(self.base_dir, "Backups")
+        self.avisos_inicializacao = []
+        try:
+            os.makedirs(self.base_dir, exist_ok=True)
+        except OSError as error:
+            raise OSError("Sem permissão para acessar a pasta de dados do Prati WMS.") from error
         self.init_database()
+        self.verificar_integridade()
+        if manutencao_automatica:
+            try:
+                self.limpar_historico_antigo()
+            except (OSError, sqlite3.Error) as error:
+                self.avisos_inicializacao.append(f"Não foi possível limpar o histórico antigo: {error}")
+            try:
+                self.criar_backup_automatico()
+            except (OSError, sqlite3.Error) as error:
+                self.avisos_inicializacao.append(f"Não foi possível criar o backup diário: {error}")
 
     @contextlib.contextmanager
     def get_connection(self):
-        connection = sqlite3.connect(self.db_path)
+        connection = sqlite3.connect(self.db_path, timeout=10)
         connection.row_factory = sqlite3.Row
         try:
             yield connection
@@ -149,8 +283,76 @@ class DatabaseManager:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_itens_busca ON itens_estoque (codigo_produto, lote, nome_medicamento)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_itens_loc ON itens_estoque (codigo_localizacao)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_hist_data ON historico_movimentacoes (data_hora)")
-            if cursor.execute("SELECT COUNT(*) FROM itens_estoque").fetchone()[0] == 0:
-                self._seed_inicial(cursor)
+
+    def verificar_integridade(self):
+        connection = sqlite3.connect(self.db_path, timeout=10)
+        try:
+            resultado = connection.execute("PRAGMA quick_check").fetchone()[0]
+        finally:
+            connection.close()
+        if resultado != "ok":
+            raise sqlite3.DatabaseError(
+                "O banco de dados apresentou um problema de integridade. "
+                "Feche o programa e restaure um arquivo da pasta Backups."
+            )
+
+    def limpar_historico_antigo(self, agora=None):
+        limite = (agora or datetime.now()) - timedelta(days=HISTORY_RETENTION_DAYS)
+        ids_antigos = []
+        with self.get_connection() as connection:
+            for row in connection.execute("SELECT id, data_hora FROM historico_movimentacoes"):
+                try:
+                    data_registro = datetime.strptime(row["data_hora"], "%d/%m/%Y %H:%M:%S")
+                except (TypeError, ValueError):
+                    continue
+                if data_registro < limite:
+                    ids_antigos.append((row["id"],))
+            connection.executemany("DELETE FROM historico_movimentacoes WHERE id = ?", ids_antigos)
+        return len(ids_antigos)
+
+    def criar_backup(self, caminho):
+        caminho = os.path.abspath(caminho)
+        if caminho == self.db_path:
+            raise ValueError("Escolha um arquivo diferente do banco em uso.")
+        os.makedirs(os.path.dirname(caminho), exist_ok=True)
+        temporario = f"{caminho}.tmp"
+        if os.path.exists(temporario):
+            os.remove(temporario)
+        origem = sqlite3.connect(self.db_path, timeout=10)
+        destino = sqlite3.connect(temporario)
+        try:
+            origem.backup(destino)
+            destino.commit()
+            resultado = destino.execute("PRAGMA integrity_check").fetchone()[0]
+            if resultado != "ok":
+                raise sqlite3.DatabaseError("O backup criado não passou na verificação de integridade.")
+        finally:
+            destino.close()
+            origem.close()
+        os.replace(temporario, caminho)
+        return caminho
+
+    def criar_backup_automatico(self, agora=None):
+        agora = agora or datetime.now()
+        os.makedirs(self.backup_dir, exist_ok=True)
+        caminho = os.path.join(self.backup_dir, f"Prati_WMS_auto_{agora:%Y-%m-%d}.db")
+        if not os.path.exists(caminho):
+            self.criar_backup(caminho)
+        self._limpar_backups_automaticos()
+        return caminho
+
+    def _limpar_backups_automaticos(self):
+        arquivos = sorted(
+            (
+                os.path.join(self.backup_dir, nome)
+                for nome in os.listdir(self.backup_dir)
+                if nome.startswith("Prati_WMS_auto_") and nome.endswith(".db")
+            ),
+            key=os.path.basename,
+            reverse=True,
+        )
+        for caminho in arquivos[BACKUP_RETENTION:]:
+            os.remove(caminho)
 
     def _seed_inicial(self, cursor):
         dados = [
@@ -403,12 +605,24 @@ class PratiWMSApp(tk.Tk):
         self.geometry("1280x780")
         self.minsize(1050, 660)
         self.configure(bg=BG)
-        self.db = DatabaseManager()
+        try:
+            self.db = DatabaseManager()
+        except (OSError, sqlite3.Error) as error:
+            messagebox.showerror(
+                "Banco de dados indisponível",
+                f"O Prati WMS não conseguiu abrir o banco de dados.\n\n{error}\n\n"
+                "Mova o programa para uma pasta gravável ou restaure um backup.",
+                parent=self,
+            )
+            self.destroy()
+            raise SystemExit(1) from error
         self.paginas = {}
         self.botoes_nav = {}
         self._configurar_estilos()
         self._construir_interface()
         self.mostrar_pagina("inicio")
+        if self.db.avisos_inicializacao:
+            self.after(300, self._mostrar_avisos_inicializacao)
 
     def _configurar_estilos(self):
         style = ttk.Style(self)
@@ -431,7 +645,7 @@ class PratiWMSApp(tk.Tk):
         tk.Label(marca, text="WMS", bg=PRIMARY, fg=TEXT, font=("Segoe UI Bold", 9), padx=7, pady=3).pack(side="left", padx=(8, 0))
         navegacao = tk.Frame(header, bg=HEADER)
         navegacao.pack(side="left", fill="y")
-        for chave, texto in (("inicio", "Início"), ("consultar", "Consultar"), ("cadastrar", "Cadastrar"), ("historico", "Histórico")):
+        for chave, texto in (("inicio", "Início"), ("consultar", "Consultar"), ("cadastrar", "Cadastrar"), ("historico", "Histórico"), ("etiquetas", "Etiquetas")):
             botao = tk.Button(
                 navegacao, text=texto, command=lambda pagina=chave: self.mostrar_pagina(pagina),
                 bg=HEADER, fg=MUTED, activebackground=HEADER, activeforeground=TEXT,
@@ -444,7 +658,7 @@ class PratiWMSApp(tk.Tk):
 
         self.container = tk.Frame(self, bg=BG)
         self.container.pack(fill="both", expand=True)
-        for chave, classe in (("inicio", InicioView), ("consultar", ConsultarView), ("cadastrar", CadastrarView), ("historico", HistoricoView)):
+        for chave, classe in (("inicio", InicioView), ("consultar", ConsultarView), ("cadastrar", CadastrarView), ("historico", HistoricoView), ("etiquetas", EtiquetasView)):
             pagina = classe(self.container, self)
             pagina.place(relx=0, rely=0, relwidth=1, relheight=1)
             self.paginas[chave] = pagina
@@ -460,6 +674,13 @@ class PratiWMSApp(tk.Tk):
     def atualizar_todas(self):
         for pagina in self.paginas.values():
             pagina.on_show()
+
+    def _mostrar_avisos_inicializacao(self):
+        messagebox.showwarning(
+            "Manutenção do banco",
+            "\n\n".join(self.db.avisos_inicializacao),
+            parent=self,
+        )
 
 
 class BaseView(tk.Frame):
@@ -493,6 +714,7 @@ class InicioView(BaseView):
         criar_botao(atalhos, "+ Novo cadastro", lambda: self.app.mostrar_pagina("cadastrar"), "secondary").pack(side="left", padx=5)
         criar_botao(atalhos, "Importar Excel", self._abrir_importacao, "secondary").pack(side="left", padx=5)
         criar_botao(atalhos, "Consultar estoque", lambda: self.app.mostrar_pagina("consultar"), "secondary").pack(side="left", padx=5)
+        criar_botao(atalhos, "Fazer backup", self._fazer_backup, "secondary").pack(side="left", padx=5)
         metricas = tk.Frame(self, bg=BG)
         metricas.pack(fill="x", padx=34)
         for indice, (chave, titulo, cor) in enumerate((
@@ -536,6 +758,28 @@ class InicioView(BaseView):
     def _abrir_importacao(self):
         self.app.mostrar_pagina("cadastrar")
         self.app.paginas["cadastrar"].importar_excel()
+
+    def _fazer_backup(self):
+        caminho = filedialog.asksaveasfilename(
+            parent=self,
+            title="Salvar backup do Prati WMS",
+            initialdir=self.app.db.backup_dir,
+            initialfile=f"Prati_WMS_backup_{datetime.now():%Y-%m-%d_%H%M}.db",
+            defaultextension=".db",
+            filetypes=(("Banco SQLite", "*.db"),),
+        )
+        if not caminho:
+            return
+        try:
+            self.app.db.criar_backup(caminho)
+        except (OSError, ValueError, sqlite3.Error) as error:
+            messagebox.showerror("Backup não realizado", str(error), parent=self)
+            return
+        messagebox.showinfo(
+            "Backup concluído",
+            f"O backup foi salvo com segurança em:\n{caminho}",
+            parent=self,
+        )
 
 
 class ConsultarView(BaseView):
@@ -766,7 +1010,7 @@ class HistoricoView(BaseView):
         super().__init__(parent, app)
         self.busca = tk.StringVar()
         self.tipo = tk.StringVar(value="Todos")
-        self.cabecalho("Histórico", "Rastreabilidade completa de entradas, alterações e remoções.")
+        self.cabecalho("Histórico", "Entradas, alterações e remoções dos últimos 2 dias.")
         painel = tk.Frame(self, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
         painel.pack(fill="both", expand=True, padx=34, pady=(0, 28))
         filtros = tk.Frame(painel, bg=SURFACE)
@@ -829,6 +1073,334 @@ class HistoricoView(BaseView):
             for row in rows:
                 writer.writerow((row["data_hora"], row["tipo"], row["codigo_localizacao"], row["codigo_produto"], row["nome_medicamento"], row["lote"], row["quantidade"], row["motivo"]))
         messagebox.showinfo("Exportação concluída", "O histórico foi exportado com sucesso.", parent=self)
+
+
+class EtiquetasView(BaseView):
+    LARGURA_PREVIA = 558
+    ALTURA_PREVIA = 372
+
+    def __init__(self, parent, app):
+        super().__init__(parent, app)
+        self.elementos = []
+        self.selecionado = None
+        self.modo_arraste = None
+        self.ultimo_ponto = None
+        self.dados_redimensionamento = None
+        self.fantasma_texto = None
+        self.imagem_previa = None
+        self.impressora = tk.StringVar()
+        self.status_impressora = tk.StringVar(value="Buscando impressoras...")
+        self.cabecalho("Etiquetas", "Monte etiquetas Zebra SAMPLE horizontais com texto ou imagem.")
+        self._construir()
+        self.nova_etiqueta(confirmar=False)
+
+    def _construir(self):
+        barra = tk.Frame(self, bg=BG)
+        barra.pack(fill="x", padx=34, pady=(0, 14))
+        criar_botao(barra, "Nova etiqueta", self.nova_etiqueta).pack(side="left")
+        criar_botao(barra, "Abrir modelo", self.abrir_modelo, "secondary").pack(side="left", padx=8)
+        criar_botao(barra, "Salvar modelo", self.salvar_modelo, "secondary").pack(side="left")
+        tk.Label(barra, text="Zebra SAMPLE  •  6 × 4 pol.  •  203 dpi  •  Horizontal", bg=BG, fg=MUTED, font=("Segoe UI", 9)).pack(side="right")
+
+        area = tk.Frame(self, bg=BG)
+        area.pack(fill="both", expand=True, padx=34, pady=(0, 24))
+
+        painel_conteudo = tk.Frame(area, bg=SURFACE, width=220, highlightbackground=BORDER, highlightthickness=1)
+        painel_conteudo.pack(side="left", fill="y", padx=(0, 16))
+        painel_conteudo.pack_propagate(False)
+        tk.Label(painel_conteudo, text="ELEMENTOS", bg=SURFACE, fg=MUTED, font=("Segoe UI Semibold", 9)).pack(anchor="w", padx=18, pady=(18, 14))
+        self.ferramenta_texto = tk.Label(
+            painel_conteudo, text="T   Adicionar texto", bg=SURFACE_ALT, fg=TEXT,
+            relief="flat", cursor="hand2", font=("Segoe UI Semibold", 10),
+            padx=14, pady=14, highlightbackground=BORDER, highlightthickness=1,
+        )
+        self.ferramenta_texto.pack(fill="x", padx=18)
+        self.ferramenta_texto.bind("<ButtonPress-1>", self._iniciar_ferramenta_texto)
+        self.ferramenta_texto.bind("<B1-Motion>", self._mover_ferramenta_texto)
+        self.ferramenta_texto.bind("<ButtonRelease-1>", self._soltar_ferramenta_texto)
+        tk.Label(
+            painel_conteudo,
+            text="Arraste a ferramenta para a etiqueta.\n\nDuplo clique: editar texto\nAlças roxas: redimensionar\nCtrl+V: colar imagem\nDelete: excluir selecionado",
+            justify="left", bg=SURFACE, fg=MUTED, font=("Segoe UI", 8),
+        ).pack(anchor="w", padx=18, pady=18)
+        tk.Label(painel_conteudo, text="Fonte fixa\nArial Black", justify="left", bg=SURFACE, fg=TEXT, font=("Arial Black", 11)).pack(side="bottom", anchor="w", padx=18, pady=18)
+
+        centro = tk.Frame(area, bg=BG)
+        centro.pack(side="left", fill="both", expand=True)
+        tk.Label(centro, text="PRÉ-VISUALIZAÇÃO", bg=BG, fg=MUTED, font=("Segoe UI Semibold", 9)).pack(pady=(0, 8))
+        self.canvas = tk.Canvas(
+            centro, width=self.LARGURA_PREVIA, height=self.ALTURA_PREVIA,
+            bg="white", bd=0, highlightbackground=BORDER, highlightthickness=2,
+            cursor="arrow",
+        )
+        self.canvas.pack()
+        self.canvas.bind("<Button-1>", self._iniciar_arraste)
+        self.canvas.bind("<B1-Motion>", self._arrastar)
+        self.canvas.bind("<ButtonRelease-1>", self._finalizar_arraste)
+        self.canvas.bind("<Double-1>", self._editar_texto)
+        self.canvas.bind("<Motion>", self._atualizar_cursor)
+        self.canvas.bind("<Delete>", lambda _event: self.excluir_selecionado())
+        self.canvas.bind("<Control-v>", lambda _event: self.colar_imagem())
+
+        painel_impressao = tk.Frame(area, bg=SURFACE, width=260, highlightbackground=BORDER, highlightthickness=1)
+        painel_impressao.pack(side="right", fill="y", padx=(16, 0))
+        painel_impressao.pack_propagate(False)
+        tk.Label(painel_impressao, text="IMPRESSÃO", bg=SURFACE, fg=MUTED, font=("Segoe UI Semibold", 9)).pack(anchor="w", padx=18, pady=(18, 14))
+        tk.Label(painel_impressao, text="Impressora do Windows", bg=SURFACE, fg=TEXT, font=("Segoe UI Semibold", 9)).pack(anchor="w", padx=18)
+        self.combo_impressora = ttk.Combobox(painel_impressao, textvariable=self.impressora, state="readonly")
+        self.combo_impressora.pack(fill="x", padx=18, pady=(7, 10))
+        criar_botao(painel_impressao, "Atualizar impressoras", self.atualizar_impressoras, "secondary").pack(fill="x", padx=18)
+        tk.Label(painel_impressao, textvariable=self.status_impressora, wraplength=220, justify="left", bg=SURFACE, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="w", padx=18, pady=14)
+        informacao = tk.Frame(painel_impressao, bg=SURFACE_ALT)
+        informacao.pack(fill="x", padx=18, pady=(6, 18))
+        tk.Label(informacao, text="FORMATO DA MÍDIA", bg=SURFACE_ALT, fg=MUTED, font=("Segoe UI Semibold", 8)).pack(anchor="w", padx=12, pady=(12, 4))
+        tk.Label(informacao, text="152,4 × 101,6 mm\n1218 × 812 pontos\nOrientação: horizontal", justify="left", bg=SURFACE_ALT, fg=TEXT, font=("Segoe UI", 9)).pack(anchor="w", padx=12, pady=(0, 12))
+        criar_botao(painel_impressao, "Imprimir etiqueta", self.imprimir).pack(side="bottom", fill="x", padx=18, pady=18)
+
+    def on_show(self):
+        self.atualizar_impressoras()
+        self._atualizar_previa()
+
+    def nova_etiqueta(self, confirmar=True):
+        if confirmar and self.elementos and not messagebox.askyesno("Nova etiqueta", "Descartar o conteúdo atual e criar uma nova etiqueta?", parent=self):
+            return
+        self.elementos = []
+        self.selecionado = None
+        self._atualizar_previa()
+
+    def abrir_modelo(self):
+        caminho = filedialog.askopenfilename(parent=self, title="Abrir modelo de etiqueta", filetypes=(("Modelo Prati", "*.prati-etiqueta"), ("Arquivo JSON", "*.json")))
+        if not caminho:
+            return
+        try:
+            self.elementos = abrir_modelo_etiqueta(caminho)
+            self.selecionado = None
+            self._atualizar_previa()
+        except (OSError, ValueError, KeyError, json.JSONDecodeError, base64.binascii.Error) as error:
+            messagebox.showerror("Modelo inválido", str(error), parent=self)
+
+    def salvar_modelo(self):
+        caminho = filedialog.asksaveasfilename(parent=self, title="Salvar modelo de etiqueta", defaultextension=".prati-etiqueta", filetypes=(("Modelo Prati", "*.prati-etiqueta"),))
+        if not caminho:
+            return
+        try:
+            salvar_modelo_etiqueta(caminho, self.elementos)
+            messagebox.showinfo("Modelo salvo", "O modelo foi salvo com sucesso.", parent=self)
+        except OSError as error:
+            messagebox.showerror("Não foi possível salvar", str(error), parent=self)
+
+    def _iniciar_ferramenta_texto(self, event):
+        self._destruir_fantasma_texto()
+        self.fantasma_texto = tk.Toplevel(self)
+        self.fantasma_texto.overrideredirect(True)
+        self.fantasma_texto.attributes("-topmost", True)
+        tk.Label(self.fantasma_texto, text="T  Texto", bg=PRIMARY, fg=TEXT, font=("Segoe UI Semibold", 10), padx=12, pady=7).pack()
+        self._mover_ferramenta_texto(event)
+
+    def _mover_ferramenta_texto(self, event):
+        if self.fantasma_texto is not None:
+            self.fantasma_texto.geometry(f"+{event.x_root + 12}+{event.y_root + 12}")
+
+    def _soltar_ferramenta_texto(self, event):
+        self._destruir_fantasma_texto()
+        x_canvas = event.x_root - self.canvas.winfo_rootx()
+        y_canvas = event.y_root - self.canvas.winfo_rooty()
+        if 0 <= x_canvas <= self.LARGURA_PREVIA and 0 <= y_canvas <= self.ALTURA_PREVIA:
+            x = x_canvas * LABEL_WIDTH_PX / self.LARGURA_PREVIA
+            y = y_canvas * LABEL_HEIGHT_PX / self.ALTURA_PREVIA
+            self._adicionar_texto(x, y)
+
+    def _destruir_fantasma_texto(self):
+        if self.fantasma_texto is not None:
+            self.fantasma_texto.destroy()
+            self.fantasma_texto = None
+
+    def _adicionar_texto(self, x, y):
+        texto = simpledialog.askstring("Adicionar texto", "Digite o texto da etiqueta:", parent=self)
+        if texto is None or not texto.strip():
+            return
+        self.elementos.append({"tipo": "texto", "x": x, "y": y, "texto": texto.strip(), "tamanho": 28})
+        self.selecionado = len(self.elementos) - 1
+        self._atualizar_previa()
+
+    def _editar_texto(self, event):
+        x, y = self._ponto_modelo(event)
+        indice = self._elemento_no_ponto(x, y)
+        if indice is None or self.elementos[indice]["tipo"] != "texto":
+            return
+        elemento = self.elementos[indice]
+        texto = simpledialog.askstring("Editar texto", "Altere o texto da etiqueta:", initialvalue=elemento["texto"], parent=self)
+        if texto is not None and texto.strip():
+            elemento["texto"] = texto.strip()
+            self.selecionado = indice
+            self._atualizar_previa()
+
+    def colar_imagem(self):
+        try:
+            conteudo = ImageGrab.grabclipboard()
+            if isinstance(conteudo, list) and conteudo:
+                conteudo = Image.open(conteudo[0])
+            if not isinstance(conteudo, Image.Image):
+                raise ValueError("A área de transferência não contém uma imagem.")
+            imagem = conteudo.convert("RGBA")
+            escala = min(600 / imagem.width, 600 / imagem.height, 1.0)
+            largura = max(1, round(imagem.width * escala))
+            altura = max(1, round(imagem.height * escala))
+            self.elementos.append({"tipo": "imagem", "x": LABEL_WIDTH_PX // 2, "y": LABEL_HEIGHT_PX // 2, "largura": largura, "altura": altura, "imagem": imagem})
+            self.selecionado = len(self.elementos) - 1
+            self._atualizar_previa()
+        except (OSError, ValueError) as error:
+            messagebox.showwarning("Imagem não encontrada", str(error), parent=self)
+
+    def excluir_selecionado(self):
+        if self.selecionado is None:
+            return
+        del self.elementos[self.selecionado]
+        self.selecionado = None
+        self._atualizar_previa()
+
+    def atualizar_impressoras(self):
+        try:
+            impressoras = listar_impressoras()
+            self.combo_impressora.configure(values=impressoras)
+            if impressoras:
+                try:
+                    padrao = win32print.GetDefaultPrinter()
+                except Exception:
+                    padrao = impressoras[0]
+                self.impressora.set(padrao if padrao in impressoras else impressoras[0])
+                self.status_impressora.set(f"{len(impressoras)} impressora(s) disponível(is). Usa o driver instalado no Windows.")
+            else:
+                self.impressora.set("")
+                self.status_impressora.set("Nenhuma impressora instalada. O editor e os modelos continuam disponíveis.")
+        except Exception as error:
+            self.impressora.set("")
+            self.status_impressora.set(f"Não foi possível consultar as impressoras: {error}")
+
+    def imprimir(self):
+        if not self.elementos:
+            messagebox.showwarning("Etiqueta vazia", "Adicione texto ou imagem antes de imprimir.", parent=self)
+            return
+        if not self.impressora.get():
+            messagebox.showwarning("Sem impressora", "Instale ou conecte uma impressora no Windows e atualize a lista.", parent=self)
+            return
+        try:
+            imprimir_imagem_windows(renderizar_etiqueta(self.elementos), self.impressora.get())
+            messagebox.showinfo("Etiqueta enviada", f"A etiqueta foi enviada para {self.impressora.get()}.", parent=self)
+        except Exception as error:
+            messagebox.showerror("Falha na impressão", str(error), parent=self)
+
+    def _caixa_elemento(self, elemento):
+        if elemento["tipo"] == "imagem":
+            meia_largura = elemento["largura"] / 2
+            meia_altura = elemento["altura"] / 2
+            return (elemento["x"] - meia_largura, elemento["y"] - meia_altura, elemento["x"] + meia_largura, elemento["y"] + meia_altura)
+        caixa = fonte_arial_black(elemento["tamanho"]).getbbox(elemento["texto"])
+        largura, altura = caixa[2] - caixa[0], caixa[3] - caixa[1]
+        return (elemento["x"] - largura / 2, elemento["y"] - altura / 2, elemento["x"] + largura / 2, elemento["y"] + altura / 2)
+
+    def _atualizar_previa(self):
+        if not hasattr(self, "canvas"):
+            return
+        imagem = renderizar_etiqueta(self.elementos).resize((self.LARGURA_PREVIA, self.ALTURA_PREVIA), Image.Resampling.LANCZOS)
+        self.imagem_previa = ImageTk.PhotoImage(imagem)
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, image=self.imagem_previa, anchor="nw")
+        if self.selecionado is not None and self.selecionado < len(self.elementos):
+            x1, y1, x2, y2 = self._caixa_elemento(self.elementos[self.selecionado])
+            escala_x = self.LARGURA_PREVIA / LABEL_WIDTH_PX
+            escala_y = self.ALTURA_PREVIA / LABEL_HEIGHT_PX
+            caixa = (x1 * escala_x, y1 * escala_y, x2 * escala_x, y2 * escala_y)
+            self.canvas.create_rectangle(*caixa, outline="#7C3AED", width=2, dash=(4, 2))
+            for x, y in self._alcas_selecao(caixa):
+                self.canvas.create_rectangle(x - 5, y - 5, x + 5, y + 5, fill="#7C3AED", outline="white", width=1)
+
+    def _ponto_modelo(self, event):
+        return (event.x * LABEL_WIDTH_PX / self.LARGURA_PREVIA, event.y * LABEL_HEIGHT_PX / self.ALTURA_PREVIA)
+
+    @staticmethod
+    def _alcas_selecao(caixa):
+        x1, y1, x2, y2 = caixa
+        return ((x1, y1), (x2, y1), (x1, y2), (x2, y2))
+
+    def _caixa_selecao_canvas(self):
+        if self.selecionado is None or self.selecionado >= len(self.elementos):
+            return None
+        x1, y1, x2, y2 = self._caixa_elemento(self.elementos[self.selecionado])
+        return (
+            x1 * self.LARGURA_PREVIA / LABEL_WIDTH_PX,
+            y1 * self.ALTURA_PREVIA / LABEL_HEIGHT_PX,
+            x2 * self.LARGURA_PREVIA / LABEL_WIDTH_PX,
+            y2 * self.ALTURA_PREVIA / LABEL_HEIGHT_PX,
+        )
+
+    def _alca_no_ponto(self, x, y):
+        caixa = self._caixa_selecao_canvas()
+        if caixa is None:
+            return None
+        for indice, (alca_x, alca_y) in enumerate(self._alcas_selecao(caixa)):
+            if abs(x - alca_x) <= 9 and abs(y - alca_y) <= 9:
+                return indice
+        return None
+
+    def _elemento_no_ponto(self, x, y):
+        for indice in range(len(self.elementos) - 1, -1, -1):
+            x1, y1, x2, y2 = self._caixa_elemento(self.elementos[indice])
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                return indice
+        return None
+
+    def _atualizar_cursor(self, event):
+        if self._alca_no_ponto(event.x, event.y) is not None:
+            self.canvas.configure(cursor="sizing")
+            return
+        x, y = self._ponto_modelo(event)
+        self.canvas.configure(cursor="fleur" if self._elemento_no_ponto(x, y) is not None else "arrow")
+
+    def _iniciar_arraste(self, event):
+        self.canvas.focus_set()
+        x, y = self._ponto_modelo(event)
+        alca = self._alca_no_ponto(event.x, event.y)
+        if alca is not None and self.selecionado is not None:
+            elemento = self.elementos[self.selecionado]
+            distancia = max(1, math.hypot(x - elemento["x"], y - elemento["y"]))
+            self.dados_redimensionamento = {
+                "distancia": distancia,
+                "tamanho": elemento.get("tamanho"),
+                "largura": elemento.get("largura"),
+                "altura": elemento.get("altura"),
+            }
+            self.modo_arraste = "redimensionar"
+        else:
+            self.selecionado = self._elemento_no_ponto(x, y)
+            self.modo_arraste = "mover" if self.selecionado is not None else None
+        self.ultimo_ponto = (x, y)
+        self._atualizar_previa()
+
+    def _arrastar(self, event):
+        if self.modo_arraste is None or self.selecionado is None:
+            return
+        x, y = self._ponto_modelo(event)
+        elemento = self.elementos[self.selecionado]
+        if self.modo_arraste == "redimensionar":
+            distancia = max(1, math.hypot(x - elemento["x"], y - elemento["y"]))
+            fator = distancia / self.dados_redimensionamento["distancia"]
+            if elemento["tipo"] == "texto":
+                elemento["tamanho"] = max(8, min(160, round(self.dados_redimensionamento["tamanho"] * fator)))
+            else:
+                elemento["largura"] = max(20, min(LABEL_WIDTH_PX, round(self.dados_redimensionamento["largura"] * fator)))
+                elemento["altura"] = max(20, min(LABEL_HEIGHT_PX, round(self.dados_redimensionamento["altura"] * fator)))
+        else:
+            anterior_x, anterior_y = self.ultimo_ponto
+            elemento["x"] = max(0, min(LABEL_WIDTH_PX, elemento["x"] + x - anterior_x))
+            elemento["y"] = max(0, min(LABEL_HEIGHT_PX, elemento["y"] + y - anterior_y))
+        self.ultimo_ponto = (x, y)
+        self._atualizar_previa()
+
+    def _finalizar_arraste(self, _event):
+        self.modo_arraste = None
+        self.ultimo_ponto = None
+        self.dados_redimensionamento = None
 
 
 class ItemDialog(tk.Toplevel):
