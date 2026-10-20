@@ -15,12 +15,16 @@ from xml.sax.saxutils import escape
 
 from PIL import Image
 
+import app as app_module
+
 # Importa a lógica de negócio do sistema principal
 from app import (
     LABEL_HEIGHT_PX,
     LABEL_WIDTH_PX,
     DatabaseManager,
+    EtiquetasView,
     abrir_modelo_etiqueta,
+    dimensoes_texto_etiqueta,
     imprimir_imagem_windows,
     listar_impressoras,
     parse_localizacao,
@@ -362,6 +366,59 @@ class TestManutencaoBanco(unittest.TestCase):
         self.assertEqual(automaticos[0], "Prati_WMS_auto_2026-01-03.db")
 
 
+class TestTemasInterface(unittest.TestCase):
+    def test_alternancia_aplica_as_duas_paletas(self):
+        original = "claro" if app_module.BG == app_module.THEMES["claro"]["BG"] else "escuro"
+        try:
+            for nome in ("claro", "escuro"):
+                app_module.definir_tema(nome)
+                self.assertEqual(app_module.BG, app_module.THEMES[nome]["BG"])
+                self.assertEqual(app_module.PRIMARY, "#3F1E69")
+                self.assertNotEqual(app_module.TEXT, app_module.BG)
+        finally:
+            app_module.definir_tema(original)
+
+    def test_preferencia_de_tema_e_salva_localmente(self):
+        with tempfile.TemporaryDirectory() as pasta:
+            original = app_module.CONFIG_PATH
+            app_module.CONFIG_PATH = os.path.join(pasta, "config.json")
+            try:
+                app_module.salvar_tema("escuro")
+                self.assertEqual(app_module.carregar_tema(), "escuro")
+            finally:
+                app_module.CONFIG_PATH = original
+
+
+class TestCompatibilidadeWindows(unittest.TestCase):
+    def setUp(self):
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    def _ler(self, nome):
+        with open(os.path.join(self.base_dir, nome), "r", encoding="utf-8") as arquivo:
+            return arquivo.read()
+
+    def test_manifesto_declara_windows_moderno_sem_elevacao(self):
+        manifesto = self._ler("Prati_WMS.manifest")
+        self.assertIn('processorArchitecture="amd64"', manifesto)
+        self.assertIn('level="asInvoker"', manifesto)
+        self.assertIn('uiAccess="false"', manifesto)
+        self.assertIn("{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}", manifesto)
+        self.assertNotIn("requireAdministrator", manifesto)
+
+    def test_build_fixa_python_312_e_64_bits(self):
+        spec = self._ler("Prati_WMS.spec")
+        requisitos = self._ler("requirements-build.txt")
+        script = self._ler("build_windows.ps1")
+        self.assertIn("sys.version_info[:2] != (3, 12)", spec)
+        self.assertIn("struct.calcsize('P') * 8 != 64", spec)
+        self.assertIn("manifest='Prati_WMS.manifest'", spec)
+        self.assertIn("uac_admin=False", spec)
+        self.assertIn("pyinstaller==6.22.3", requisitos)
+        self.assertIn("Get-FileHash", script)
+        self.assertIn("Feche todas as janelas do Prati WMS", script)
+        self.assertIn("$env:TEMP", script)
+
+
 class TestEtiquetasZebra(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -385,12 +442,29 @@ class TestEtiquetasZebra(unittest.TestCase):
         self.assertNotEqual(etiqueta.getbbox(), None)
 
     def test_modelo_preserva_texto_e_imagem(self):
+        elementos_originais = self._elementos()
+        elementos_originais[0].update({"escala_x": 1.4, "escala_y": 0.8})
         caminho = os.path.join(self.temp_dir.name, "modelo.prati-etiqueta")
-        salvar_modelo_etiqueta(caminho, self._elementos())
+        salvar_modelo_etiqueta(caminho, elementos_originais)
         elementos = abrir_modelo_etiqueta(caminho)
         self.assertEqual(elementos[0]["texto"], "PRATI WMS")
         self.assertEqual(elementos[0]["tamanho"], 28)
+        self.assertEqual(elementos[0]["escala_x"], 1.4)
+        self.assertEqual(elementos[0]["escala_y"], 0.8)
         self.assertEqual(elementos[1]["imagem"].size, (80, 60))
+
+    def test_texto_tem_dimensoes_horizontal_e_vertical_independentes(self):
+        natural = {"tipo": "texto", "x": 400, "y": 200, "texto": "PRATI", "tamanho": 28}
+        largura, altura = dimensoes_texto_etiqueta(natural)[:2]
+        alterado = {**natural, "escala_x": 1.8, "escala_y": 0.6}
+        largura_alterada, altura_alterada = dimensoes_texto_etiqueta(alterado)[:2]
+        self.assertAlmostEqual(largura_alterada / largura, 1.8, delta=0.03)
+        self.assertAlmostEqual(altura_alterada / altura, 0.6, delta=0.03)
+
+    def test_selecao_exibe_oito_alcas(self):
+        alcas = EtiquetasView._alcas_selecao((10, 20, 110, 70))
+        self.assertEqual(len(alcas), 8)
+        self.assertEqual({alca[0] for alca in alcas}, {"nw", "n", "ne", "e", "se", "s", "sw", "w"})
 
     def test_descoberta_de_impressoras_sem_hardware(self):
         class ImpressorasFalsas:

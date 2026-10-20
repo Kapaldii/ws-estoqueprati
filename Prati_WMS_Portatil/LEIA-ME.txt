@@ -1,5 +1,7 @@
 PRATI WMS - COMO USAR EM OUTRO COMPUTADOR
 
+COMPATIBILIDADE: Windows 10 ou Windows 11 de 64 bits.
+
 1. Copie a pasta Prati_WMS_Portatil inteira para o pendrive.
 2. No outro computador, copie a pasta inteira do pendrive para Documentos.
 3. Não coloque o programa dentro de Program Files.
@@ -14,6 +16,19 @@ BACKUPS
 - São mantidos os 7 backups automáticos mais recentes.
 - Também é possível clicar em Fazer backup na tela Início.
 - Para levar os dados de volta, feche o programa e copie a pasta inteira.
+
+APARÊNCIA
+
+- Use o botão no canto superior direito para alternar entre Claro e Escuro.
+- A escolha fica salva para a próxima abertura.
+
+TEXTOS NAS ETIQUETAS
+
+- Arraste Adicionar texto para dentro da etiqueta.
+- A janela de texto permite várias linhas e alteração do tamanho da fonte.
+- Puxe as alças laterais para mudar a largura.
+- Puxe as alças de cima ou de baixo para mudar a altura.
+- Puxe as alças dos cantos para mudar largura e altura juntas.
 
 IMPRESSORA
 

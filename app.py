@@ -5,7 +5,6 @@ import csv
 import base64
 import io
 import json
-import math
 import os
 import re
 import sqlite3
@@ -14,7 +13,7 @@ import tkinter as tk
 import unicodedata
 import zipfile
 from datetime import datetime, timedelta
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, ttk
 from xml.etree import ElementTree
 
 import win32con
@@ -22,18 +21,34 @@ import win32print
 import win32ui
 from PIL import Image, ImageDraw, ImageFont, ImageGrab, ImageTk, ImageWin
 
-PRIMARY = "#3F1E69"
-PRIMARY_HOVER = "#573087"
-BG = "#100C18"
-HEADER = "#171020"
-SURFACE = "#1C1527"
-SURFACE_ALT = "#251B32"
-BORDER = "#392A4B"
-TEXT = "#F7F2FC"
-MUTED = "#AD9CBE"
-SUCCESS = "#42C58A"
-DANGER = "#FF6B7A"
-WARNING = "#F1B95B"
+THEMES = {
+    "claro": {
+        "PRIMARY": "#3F1E69", "PRIMARY_HOVER": "#573087",
+        "BG": "#F7F5FA", "HEADER": "#FFFFFF", "SURFACE": "#FFFFFF",
+        "SURFACE_ALT": "#F0EBF5", "BORDER": "#DED5E8",
+        "TEXT": "#21182B", "MUTED": "#71647D", "SUCCESS": "#16875D",
+        "DANGER": "#D64555", "DANGER_HOVER": "#B93646", "WARNING": "#A66A12", "ON_PRIMARY": "#FFFFFF",
+        "PRIMARY_MUTED": "#DFD0EC", "HANDLE": "#7C3AED",
+        "BRAND": "#3F1E69", "BRAND_SUB": "#74558F",
+    },
+    "escuro": {
+        "PRIMARY": "#3F1E69", "PRIMARY_HOVER": "#573087",
+        "BG": "#100C18", "HEADER": "#171020", "SURFACE": "#1C1527",
+        "SURFACE_ALT": "#251B32", "BORDER": "#392A4B",
+        "TEXT": "#F7F2FC", "MUTED": "#AD9CBE", "SUCCESS": "#42C58A",
+        "DANGER": "#FF6B7A", "DANGER_HOVER": "#E64F61", "WARNING": "#F1B95B", "ON_PRIMARY": "#FFFFFF",
+        "PRIMARY_MUTED": "#DCCDEB", "HANDLE": "#A78BFA",
+        "BRAND": "#F7F2FC", "BRAND_SUB": "#AD9CBE",
+    },
+}
+
+
+def definir_tema(nome):
+    paleta = THEMES.get(nome, THEMES["claro"])
+    globals().update(paleta)
+
+
+definir_tema("claro")
 
 RUAS = ("Rua A", "Rua B", "Rua C", "Rua D", "Frações")
 BLOCOS_POR_RUA = range(1, 35)
@@ -47,8 +62,25 @@ ARIAL_BLACK_PATH = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"
 
 BASE_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "estoque_medicamentos.db")
+CONFIG_PATH = os.path.join(BASE_DIR, "prati_wms_config.json")
 HISTORY_RETENTION_DAYS = 2
 BACKUP_RETENTION = 7
+
+
+def carregar_tema():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as arquivo:
+            nome = json.load(arquivo).get("tema")
+            return nome if nome in THEMES else "claro"
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return "claro"
+
+
+def salvar_tema(nome):
+    temporario = f"{CONFIG_PATH}.tmp"
+    with open(temporario, "w", encoding="utf-8") as arquivo:
+        json.dump({"tema": nome}, arquivo, ensure_ascii=False, indent=2)
+    os.replace(temporario, CONFIG_PATH)
 
 
 def normalizar_texto(valor):
@@ -116,17 +148,44 @@ def fonte_arial_black(tamanho_pontos):
     return ImageFont.truetype(ARIAL_BLACK_PATH, tamanho_pixels)
 
 
+def dimensoes_texto_etiqueta(elemento):
+    fonte = fonte_arial_black(elemento["tamanho"])
+    desenho = ImageDraw.Draw(Image.new("L", (1, 1)))
+    espacamento = max(2, fonte.size // 5)
+    caixa = desenho.multiline_textbbox(
+        (0, 0), elemento["texto"], font=fonte, spacing=espacamento, align="center",
+    )
+    largura_natural = max(1, caixa[2] - caixa[0])
+    altura_natural = max(1, caixa[3] - caixa[1])
+    largura = max(1, round(largura_natural * float(elemento.get("escala_x", 1.0))))
+    altura = max(1, round(altura_natural * float(elemento.get("escala_y", 1.0))))
+    return largura, altura, caixa, fonte, espacamento
+
+
+def imagem_texto_etiqueta(elemento):
+    largura, altura, caixa, fonte, espacamento = dimensoes_texto_etiqueta(elemento)
+    largura_natural = max(1, caixa[2] - caixa[0])
+    altura_natural = max(1, caixa[3] - caixa[1])
+    imagem = Image.new("RGBA", (largura_natural, altura_natural), (255, 255, 255, 0))
+    desenho = ImageDraw.Draw(imagem)
+    desenho.multiline_text(
+        (-caixa[0], -caixa[1]), elemento["texto"], fill="black", font=fonte,
+        spacing=espacamento, align="center",
+    )
+    if imagem.size != (largura, altura):
+        imagem = imagem.resize((largura, altura), Image.Resampling.LANCZOS)
+    return imagem
+
+
 def renderizar_etiqueta(elementos):
     """Renderiza uma etiqueta Zebra SAMPLE horizontal 6x4 em 203 dpi."""
     etiqueta = Image.new("RGB", (LABEL_WIDTH_PX, LABEL_HEIGHT_PX), "white")
-    desenho = ImageDraw.Draw(etiqueta)
     for elemento in elementos:
         if elemento["tipo"] == "texto":
-            desenho.text(
-                (int(elemento["x"]), int(elemento["y"])),
-                elemento["texto"], fill="black",
-                font=fonte_arial_black(elemento["tamanho"]), anchor="mm",
-            )
+            imagem = imagem_texto_etiqueta(elemento)
+            x = int(elemento["x"] - imagem.width / 2)
+            y = int(elemento["y"] - imagem.height / 2)
+            etiqueta.paste(imagem, (x, y), imagem)
         elif elemento["tipo"] == "imagem":
             imagem = elemento["imagem"].convert("RGBA")
             largura = max(1, int(elemento["largura"]))
@@ -165,6 +224,9 @@ def abrir_modelo_etiqueta(caminho):
         if tipo == "imagem":
             conteudo = base64.b64decode(item["imagem_png"])
             elemento["imagem"] = Image.open(io.BytesIO(conteudo)).convert("RGBA")
+        else:
+            elemento.setdefault("escala_x", 1.0)
+            elemento.setdefault("escala_y", 1.0)
         elementos.append(elemento)
     return elementos
 
@@ -586,21 +648,78 @@ def parse_localizacao(texto):
 
 def criar_botao(parent, texto, comando, variante="primary"):
     fundo, frente = {
-        "primary": (PRIMARY, TEXT),
+        "primary": (PRIMARY, ON_PRIMARY),
         "secondary": (SURFACE_ALT, TEXT),
-        "danger": (DANGER, "#21060A"),
+        "danger": (DANGER, ON_PRIMARY),
     }[variante]
-    return tk.Button(
+    botao = tk.Button(
         parent, text=texto, command=comando, bg=fundo, fg=frente,
         activebackground=PRIMARY_HOVER if variante == "primary" else BORDER,
-        activeforeground=TEXT, relief="flat", bd=0, cursor="hand2",
-        font=("Segoe UI Semibold", 10), padx=18, pady=10, highlightthickness=0,
+        activeforeground=ON_PRIMARY if variante in ("primary", "danger") else TEXT,
+        relief="flat", bd=0, cursor="hand2", font=("Segoe UI Semibold", 10),
+        padx=18, pady=10, highlightthickness=1, highlightbackground=fundo,
     )
+    botao.variante_prati = variante
+
+    def ao_entrar(_event):
+        cor = {"primary": PRIMARY_HOVER, "secondary": BORDER, "danger": DANGER_HOVER}[variante]
+        botao.configure(bg=cor, highlightbackground=cor)
+
+    def ao_sair(_event):
+        cor = {"primary": PRIMARY, "secondary": SURFACE_ALT, "danger": DANGER}[variante]
+        botao.configure(bg=cor, highlightbackground=cor)
+
+    botao.bind("<Enter>", ao_entrar)
+    botao.bind("<Leave>", ao_sair)
+    return botao
+
+
+def criar_card_acao(parent, icone, titulo, descricao, comando, destaque=False):
+    fundo = PRIMARY if destaque else SURFACE
+    frente = ON_PRIMARY if destaque else TEXT
+    detalhe = PRIMARY_MUTED if destaque else MUTED
+    card = tk.Frame(
+        parent, bg=fundo, cursor="hand2", highlightbackground=PRIMARY if destaque else BORDER,
+        highlightthickness=1, padx=16, pady=14,
+    )
+    topo = tk.Frame(card, bg=fundo, cursor="hand2")
+    topo.pack(fill="x")
+    tk.Label(
+        topo, text=icone, bg=fundo, fg=ON_PRIMARY if destaque else PRIMARY,
+        font=("Segoe UI Semibold", 16), cursor="hand2",
+    ).pack(side="left", padx=(0, 10))
+    textos = tk.Frame(topo, bg=fundo, cursor="hand2")
+    textos.pack(side="left", fill="x", expand=True)
+    tk.Label(textos, text=titulo, bg=fundo, fg=frente, font=("Segoe UI Semibold", 10), cursor="hand2").pack(anchor="w")
+    tk.Label(textos, text=descricao, bg=fundo, fg=detalhe, font=("Segoe UI", 8), cursor="hand2").pack(anchor="w", pady=(2, 0))
+
+    def widgets():
+        return (card, topo, textos, *topo.winfo_children(), *textos.winfo_children())
+
+    def configurar_cor(cor):
+        for widget in widgets():
+            widget.configure(bg=cor)
+
+    def entrar(_event):
+        configurar_cor(PRIMARY_HOVER if destaque else SURFACE_ALT)
+        card.configure(highlightbackground=PRIMARY)
+
+    def sair(_event):
+        configurar_cor(PRIMARY if destaque else SURFACE)
+        card.configure(highlightbackground=PRIMARY if destaque else BORDER)
+
+    for widget in widgets():
+        widget.bind("<Button-1>", lambda _event: comando())
+        widget.bind("<Enter>", entrar)
+        widget.bind("<Leave>", sair)
+    return card
 
 
 class PratiWMSApp(tk.Tk):
     def __init__(self):
         super().__init__()
+        self.tema = carregar_tema()
+        definir_tema(self.tema)
         self.title("Prati WMS | Gestão de estoque")
         self.geometry("1280x780")
         self.minsize(1050, 660)
@@ -618,6 +737,8 @@ class PratiWMSApp(tk.Tk):
             raise SystemExit(1) from error
         self.paginas = {}
         self.botoes_nav = {}
+        self.indicadores_nav = {}
+        self.pagina_atual = "inicio"
         self._configurar_estilos()
         self._construir_interface()
         self.mostrar_pagina("inicio")
@@ -628,7 +749,7 @@ class PratiWMSApp(tk.Tk):
         style = ttk.Style(self)
         style.theme_use("clam")
         style.configure("Treeview", background=SURFACE, fieldbackground=SURFACE, foreground=TEXT, rowheight=35, borderwidth=0, font=("Segoe UI", 9))
-        style.map("Treeview", background=[("selected", PRIMARY)])
+        style.map("Treeview", background=[("selected", PRIMARY)], foreground=[("selected", ON_PRIMARY)])
         style.configure("Treeview.Heading", background=SURFACE_ALT, foreground=MUTED, borderwidth=0, relief="flat", padding=(8, 10), font=("Segoe UI Semibold", 9))
         style.map("Treeview.Heading", background=[("active", SURFACE_ALT)])
         style.configure("TCombobox", fieldbackground=SURFACE_ALT, background=SURFACE_ALT, foreground=TEXT, arrowcolor=TEXT, bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER, padding=7)
@@ -636,25 +757,56 @@ class PratiWMSApp(tk.Tk):
         style.configure("Vertical.TScrollbar", background=SURFACE_ALT, troughcolor=BG, bordercolor=BG, arrowcolor=MUTED)
 
     def _construir_interface(self):
-        header = tk.Frame(self, bg=HEADER, height=76, highlightbackground=BORDER, highlightthickness=1)
+        header = tk.Frame(self, bg=HEADER, height=82)
         header.pack(fill="x")
         header.pack_propagate(False)
+
         marca = tk.Frame(header, bg=HEADER)
-        marca.pack(side="left", padx=(28, 50), fill="y")
-        tk.Label(marca, text="PRATI", bg=HEADER, fg=TEXT, font=("Segoe UI Black", 18)).pack(side="left")
-        tk.Label(marca, text="WMS", bg=PRIMARY, fg=TEXT, font=("Segoe UI Bold", 9), padx=7, pady=3).pack(side="left", padx=(8, 0))
+        marca.pack(side="left", padx=(26, 34), fill="y")
+        logo = tk.Canvas(marca, width=42, height=42, bg=HEADER, highlightthickness=0)
+        logo.pack(side="left", pady=20)
+        logo.create_polygon(21, 2, 39, 12, 21, 22, 3, 12, fill=PRIMARY_HOVER, outline="")
+        logo.create_polygon(3, 14, 20, 24, 20, 41, 3, 31, fill=PRIMARY, outline="")
+        logo.create_polygon(22, 24, 39, 14, 39, 31, 22, 41, fill=HANDLE, outline="")
+        nome_marca = tk.Frame(marca, bg=HEADER)
+        nome_marca.pack(side="left", fill="y", padx=(9, 0))
+        tk.Label(nome_marca, text="PRATI", bg=HEADER, fg=BRAND, font=("Segoe UI Black", 18)).pack(side="left", pady=22)
+        tk.Label(nome_marca, text="WMS", bg=HEADER, fg=BRAND_SUB, font=("Segoe UI Semibold", 18)).pack(side="left", padx=(6, 0), pady=22)
+
         navegacao = tk.Frame(header, bg=HEADER)
         navegacao.pack(side="left", fill="y")
-        for chave, texto in (("inicio", "Início"), ("consultar", "Consultar"), ("cadastrar", "Cadastrar"), ("historico", "Histórico"), ("etiquetas", "Etiquetas")):
+        itens_navegacao = (
+            ("inicio", "⌂  Início"),
+            ("consultar", "⌕  Consultar"),
+            ("cadastrar", "+  Cadastrar"),
+            ("historico", "◷  Histórico"),
+            ("etiquetas", "◇  Etiquetas"),
+        )
+        for chave, texto in itens_navegacao:
+            item = tk.Frame(navegacao, bg=HEADER)
+            item.pack(side="left", fill="y")
+            indicador = tk.Frame(item, bg=HEADER, height=3)
+            indicador.pack(side="bottom", fill="x", padx=14)
             botao = tk.Button(
-                navegacao, text=texto, command=lambda pagina=chave: self.mostrar_pagina(pagina),
+                item, text=texto, command=lambda pagina=chave: self.mostrar_pagina(pagina),
                 bg=HEADER, fg=MUTED, activebackground=HEADER, activeforeground=TEXT,
                 relief="flat", bd=0, cursor="hand2", font=("Segoe UI Semibold", 10),
-                padx=22, pady=25,
+                padx=14, pady=23,
             )
-            botao.pack(side="left", fill="y")
+            botao.pack(side="top", fill="both", expand=True)
+            botao.bind("<Enter>", lambda _event, pagina=chave: self._hover_navegacao(pagina, True))
+            botao.bind("<Leave>", lambda _event, pagina=chave: self._hover_navegacao(pagina, False))
             self.botoes_nav[chave] = botao
-        tk.Label(header, text="SQLite local  •  Dados neste dispositivo", bg=HEADER, fg=MUTED, font=("Segoe UI", 9)).pack(side="right", padx=28)
+            self.indicadores_nav[chave] = indicador
+
+        self.botao_tema = criar_botao(header, self._texto_botao_tema(), self.alternar_tema, "secondary")
+        self.botao_tema.configure(padx=13, pady=8)
+        self.botao_tema.pack(side="right", padx=(8, 20))
+        status = tk.Frame(header, bg=HEADER)
+        status.pack(side="right", padx=(8, 2))
+        tk.Label(status, text="●", bg=HEADER, fg=SUCCESS, font=("Segoe UI", 8)).pack(side="left")
+        tk.Label(status, text="Dados locais", bg=HEADER, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(5, 0))
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
 
         self.container = tk.Frame(self, bg=BG)
         self.container.pack(fill="both", expand=True)
@@ -664,12 +816,50 @@ class PratiWMSApp(tk.Tk):
             self.paginas[chave] = pagina
 
     def mostrar_pagina(self, chave):
+        self.pagina_atual = chave
         for nome, botao in self.botoes_nav.items():
             ativo = nome == chave
-            botao.configure(fg=TEXT if ativo else MUTED, bg=PRIMARY if ativo else HEADER, activebackground=PRIMARY if ativo else HEADER)
+            botao.configure(fg=PRIMARY if ativo else MUTED, bg=HEADER, activebackground=SURFACE_ALT)
+            self.indicadores_nav[nome].configure(bg=PRIMARY if ativo else HEADER)
         pagina = self.paginas[chave]
         pagina.tkraise()
         pagina.on_show()
+
+    def _hover_navegacao(self, chave, ativo):
+        if chave == self.pagina_atual:
+            return
+        self.botoes_nav[chave].configure(
+            bg=SURFACE_ALT if ativo else HEADER,
+            fg=TEXT if ativo else MUTED,
+        )
+
+    def _texto_botao_tema(self):
+        return "🌙 Escuro" if self.tema == "claro" else "☀ Claro"
+
+    def alternar_tema(self):
+        pagina_atual = self.pagina_atual
+        editor = self.paginas.get("etiquetas")
+        elementos = editor.elementos if editor else []
+        selecionado = editor.selecionado if editor else None
+        self.tema = "escuro" if self.tema == "claro" else "claro"
+        definir_tema(self.tema)
+        try:
+            salvar_tema(self.tema)
+        except OSError as error:
+            messagebox.showwarning("Preferência não salva", str(error), parent=self)
+        for filho in self.winfo_children():
+            filho.destroy()
+        self.configure(bg=BG)
+        self.paginas = {}
+        self.botoes_nav = {}
+        self.indicadores_nav = {}
+        self._configurar_estilos()
+        self._construir_interface()
+        novo_editor = self.paginas["etiquetas"]
+        novo_editor.elementos = elementos
+        novo_editor.selecionado = selecionado
+        novo_editor._atualizar_previa()
+        self.mostrar_pagina(pagina_atual)
 
     def atualizar_todas(self):
         for pagina in self.paginas.values():
@@ -702,34 +892,51 @@ class InicioView(BaseView):
     def __init__(self, parent, app):
         super().__init__(parent, app)
         self.metric_labels = {}
+        self.action_cards = []
+        self.metric_cards = []
         self.cabecalho("Visão geral", "Acompanhe o estoque e as últimas movimentações.")
-        destaque = tk.Frame(self, bg=PRIMARY)
+        destaque = tk.Frame(self, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
         destaque.pack(fill="x", padx=34, pady=(0, 18))
-        chamada = tk.Frame(destaque, bg=PRIMARY)
-        chamada.pack(side="left", fill="both", expand=True, padx=24, pady=18)
-        tk.Label(chamada, text="O que você deseja fazer?", bg=PRIMARY, fg=TEXT, font=("Segoe UI Semibold", 16)).pack(anchor="w")
-        tk.Label(chamada, text="Cadastre um item ou encontre rapidamente o que precisa.", bg=PRIMARY, fg="#DCCDEB", font=("Segoe UI", 9)).pack(anchor="w", pady=(4, 0))
-        atalhos = tk.Frame(destaque, bg=PRIMARY)
-        atalhos.pack(side="right", padx=20, pady=16)
-        criar_botao(atalhos, "+ Novo cadastro", lambda: self.app.mostrar_pagina("cadastrar"), "secondary").pack(side="left", padx=5)
-        criar_botao(atalhos, "Importar Excel", self._abrir_importacao, "secondary").pack(side="left", padx=5)
-        criar_botao(atalhos, "Consultar estoque", lambda: self.app.mostrar_pagina("consultar"), "secondary").pack(side="left", padx=5)
-        criar_botao(atalhos, "Fazer backup", self._fazer_backup, "secondary").pack(side="left", padx=5)
+        tk.Frame(destaque, bg=PRIMARY, width=5).pack(side="left", fill="y")
+        conteudo_destaque = tk.Frame(destaque, bg=SURFACE)
+        conteudo_destaque.pack(side="left", fill="both", expand=True, padx=20, pady=15)
+        chamada = tk.Frame(conteudo_destaque, bg=SURFACE)
+        chamada.pack(fill="x", pady=(0, 12))
+        tk.Label(chamada, text="AÇÕES RÁPIDAS", bg=SURFACE, fg=PRIMARY, font=("Segoe UI Semibold", 8)).pack(anchor="w")
+        tk.Label(chamada, text="O que você deseja fazer?", bg=SURFACE, fg=TEXT, font=("Segoe UI Semibold", 15)).pack(anchor="w", pady=(3, 0))
+        atalhos = tk.Frame(conteudo_destaque, bg=SURFACE)
+        atalhos.pack(fill="x")
+        acoes = (
+            ("+", "Novo cadastro", "Adicionar item", lambda: self.app.mostrar_pagina("cadastrar"), True),
+            ("⇧", "Importar Excel", "Cadastrar em lote", self._abrir_importacao, False),
+            ("⌕", "Consultar", "Buscar no estoque", lambda: self.app.mostrar_pagina("consultar"), False),
+            ("⤓", "Fazer backup", "Salvar uma cópia", self._fazer_backup, False),
+        )
+        for indice, (icone, titulo, descricao, comando, destaque_acao) in enumerate(acoes):
+            card_acao = criar_card_acao(atalhos, icone, titulo, descricao, comando, destaque_acao)
+            card_acao.grid(row=0, column=indice, sticky="nsew", padx=(0, 10 if indice < 3 else 0))
+            atalhos.grid_columnconfigure(indice, weight=1, uniform="acoes")
+            self.action_cards.append(card_acao)
+
         metricas = tk.Frame(self, bg=BG)
         metricas.pack(fill="x", padx=34)
-        for indice, (chave, titulo, cor) in enumerate((
-            ("itens", "Itens cadastrados", TEXT),
-            ("unidades", "Unidades em estoque", SUCCESS),
-            ("bloqueados", "Itens bloqueados", WARNING),
+        for indice, (chave, titulo, descricao, icone, cor) in enumerate((
+            ("itens", "Itens cadastrados", "posições em uso", "▦", PRIMARY),
+            ("unidades", "Unidades em estoque", "soma das quantidades", "Σ", SUCCESS),
+            ("bloqueados", "Itens bloqueados", "requerem atenção", "!", WARNING),
         )):
-            card = tk.Frame(metricas, bg=SURFACE)
+            card = tk.Frame(metricas, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
             card.grid(row=0, column=indice, sticky="nsew", padx=(0, 12 if indice < 2 else 0))
             metricas.grid_columnconfigure(indice, weight=1)
-            tk.Frame(card, bg=cor, height=3).pack(fill="x")
-            tk.Label(card, text=titulo, bg=SURFACE, fg=MUTED, font=("Segoe UI", 10)).pack(anchor="w", padx=20, pady=(18, 6))
-            label = tk.Label(card, text="—", bg=SURFACE, fg=cor, font=("Segoe UI Semibold", 28))
-            label.pack(anchor="w", padx=20, pady=(0, 18))
+            cabecalho_card = tk.Frame(card, bg=SURFACE)
+            cabecalho_card.pack(fill="x", padx=18, pady=(15, 3))
+            tk.Label(cabecalho_card, text=icone, bg=SURFACE_ALT, fg=cor, width=3, pady=5, font=("Segoe UI Semibold", 11)).pack(side="left")
+            tk.Label(cabecalho_card, text=titulo, bg=SURFACE, fg=MUTED, font=("Segoe UI Semibold", 9)).pack(side="left", padx=(10, 0))
+            label = tk.Label(card, text="—", bg=SURFACE, fg=TEXT, font=("Segoe UI Semibold", 25))
+            label.pack(anchor="w", padx=18, pady=(2, 0))
+            tk.Label(card, text=descricao, bg=SURFACE, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="w", padx=19, pady=(0, 14))
             self.metric_labels[chave] = label
+            self.metric_cards.append(card)
 
         painel = tk.Frame(self, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
         painel.pack(fill="both", expand=True, padx=34, pady=22)
@@ -788,6 +995,7 @@ class ConsultarView(BaseView):
         self.busca = tk.StringVar()
         self.filtro_status = tk.StringVar(value="Todos")
         self.contagem = tk.StringVar(value="0 itens")
+        self.acao_hover = None
         self.cabecalho("Consultar estoque", "Busque em tempo real e edite ou remova diretamente pela linha.")
         painel = tk.Frame(self, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
         painel.pack(fill="both", expand=True, padx=34, pady=(0, 28))
@@ -825,6 +1033,8 @@ class ConsultarView(BaseView):
         self.tabela.tag_configure("bloqueado", foreground=WARNING)
         self.tabela.bind("<ButtonRelease-1>", self._acao_linha)
         self.tabela.bind("<Double-1>", lambda _event: self._editar_selecionado())
+        self.tabela.bind("<Motion>", self._hover_acoes)
+        self.tabela.bind("<Leave>", lambda _event: self._limpar_hover_acoes())
 
     def on_show(self):
         self.carregar()
@@ -850,6 +1060,32 @@ class ConsultarView(BaseView):
             return
         x, _y, largura, _altura = self.tabela.bbox(item_id, "acoes")
         self._editar(item_id) if event.x < x + largura / 2 else self._remover(item_id)
+
+    def _hover_acoes(self, event):
+        item_id = self.tabela.identify_row(event.y)
+        if self.tabela.identify_region(event.x, event.y) != "cell" or self.tabela.identify_column(event.x) != "#7" or not item_id:
+            self._limpar_hover_acoes()
+            return
+        x, _y, largura, _altura = self.tabela.bbox(item_id, "acoes")
+        lado = "editar" if event.x < x + largura / 2 else "remover"
+        if self.acao_hover == (item_id, lado):
+            return
+        self._limpar_hover_acoes()
+        valores = list(self.tabela.item(item_id, "values"))
+        valores[6] = "▶ Editar     |     Remover" if lado == "editar" else "Editar     |     ▶ Remover"
+        self.tabela.item(item_id, values=valores)
+        self.tabela.configure(cursor="hand2")
+        self.acao_hover = (item_id, lado)
+
+    def _limpar_hover_acoes(self):
+        if self.acao_hover:
+            item_id, _lado = self.acao_hover
+            if self.tabela.exists(item_id):
+                valores = list(self.tabela.item(item_id, "values"))
+                valores[6] = "Editar     |     Remover"
+                self.tabela.item(item_id, values=valores)
+        self.tabela.configure(cursor="")
+        self.acao_hover = None
 
     def _editar_selecionado(self):
         selecionado = self.tabela.selection()
@@ -1075,6 +1311,76 @@ class HistoricoView(BaseView):
         messagebox.showinfo("Exportação concluída", "O histórico foi exportado com sucesso.", parent=self)
 
 
+class TextoEtiquetaDialog(tk.Toplevel):
+    def __init__(self, parent, titulo, texto="", tamanho=28):
+        super().__init__(parent)
+        self.resultado = None
+        self.title(titulo)
+        self.geometry("620x430")
+        self.minsize(520, 360)
+        self.configure(bg=BG)
+        self.transient(parent.winfo_toplevel())
+        self.grab_set()
+
+        tk.Label(self, text=titulo, bg=BG, fg=TEXT, font=("Segoe UI Semibold", 20)).pack(
+            anchor="w", padx=28, pady=(24, 4),
+        )
+        tk.Label(
+            self, text="Digite o conteúdo com clareza. Use Enter para criar novas linhas.",
+            bg=BG, fg=MUTED, font=("Segoe UI", 9),
+        ).pack(anchor="w", padx=28, pady=(0, 16))
+
+        card = tk.Frame(self, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
+        card.pack(fill="both", expand=True, padx=28, pady=(0, 18))
+        tk.Label(card, text="TEXTO DA ETIQUETA", bg=SURFACE, fg=MUTED, font=("Segoe UI Semibold", 9)).pack(
+            anchor="w", padx=18, pady=(16, 7),
+        )
+        self.entrada = tk.Text(
+            card, height=8, wrap="word", undo=True, bg=SURFACE_ALT, fg=TEXT,
+            insertbackground=TEXT, selectbackground=PRIMARY, selectforeground=ON_PRIMARY,
+            relief="flat", bd=0, font=("Segoe UI", 13), padx=12, pady=10,
+            highlightbackground=BORDER, highlightcolor=PRIMARY, highlightthickness=1,
+        )
+        self.entrada.pack(fill="both", expand=True, padx=18)
+        self.entrada.insert("1.0", texto)
+
+        tamanho_frame = tk.Frame(card, bg=SURFACE)
+        tamanho_frame.pack(fill="x", padx=18, pady=14)
+        tk.Label(tamanho_frame, text="Tamanho da fonte", bg=SURFACE, fg=TEXT, font=("Segoe UI Semibold", 9)).pack(side="left")
+        self.tamanho = tk.IntVar(value=int(tamanho))
+        tk.Spinbox(
+            tamanho_frame, from_=8, to=160, textvariable=self.tamanho, width=6,
+            bg=SURFACE_ALT, fg=TEXT, insertbackground=TEXT, buttonbackground=SURFACE_ALT,
+            relief="flat", font=("Segoe UI", 10), highlightbackground=BORDER,
+            highlightcolor=PRIMARY, highlightthickness=1,
+        ).pack(side="left", padx=(12, 6), ipady=5)
+        tk.Label(tamanho_frame, text="pt  •  Fonte fixa: Arial Black", bg=SURFACE, fg=MUTED, font=("Segoe UI", 9)).pack(side="left")
+
+        acoes = tk.Frame(self, bg=BG)
+        acoes.pack(fill="x", padx=28, pady=(0, 24))
+        criar_botao(acoes, "Cancelar", self.destroy, "secondary").pack(side="right")
+        criar_botao(acoes, "Aplicar texto", self._confirmar).pack(side="right", padx=(0, 10))
+        self.bind("<Escape>", lambda _event: self.destroy())
+        self.bind("<Control-Return>", lambda _event: self._confirmar())
+        self.after_idle(self._preparar_foco)
+
+    def _preparar_foco(self):
+        self.entrada.focus_set()
+        self.entrada.mark_set("insert", "end-1c")
+
+    def _confirmar(self):
+        texto = self.entrada.get("1.0", "end-1c").strip()
+        if not texto:
+            messagebox.showwarning("Texto vazio", "Digite o texto que será colocado na etiqueta.", parent=self)
+            return
+        try:
+            tamanho = int(self.tamanho.get())
+        except (TypeError, ValueError):
+            tamanho = 28
+        self.resultado = {"texto": texto, "tamanho": max(8, min(160, tamanho))}
+        self.destroy()
+
+
 class EtiquetasView(BaseView):
     LARGURA_PREVIA = 558
     ALTURA_PREVIA = 372
@@ -1118,9 +1424,11 @@ class EtiquetasView(BaseView):
         self.ferramenta_texto.bind("<ButtonPress-1>", self._iniciar_ferramenta_texto)
         self.ferramenta_texto.bind("<B1-Motion>", self._mover_ferramenta_texto)
         self.ferramenta_texto.bind("<ButtonRelease-1>", self._soltar_ferramenta_texto)
+        self.ferramenta_texto.bind("<Enter>", lambda _event: self.ferramenta_texto.configure(bg=BORDER))
+        self.ferramenta_texto.bind("<Leave>", lambda _event: self.ferramenta_texto.configure(bg=SURFACE_ALT))
         tk.Label(
             painel_conteudo,
-            text="Arraste a ferramenta para a etiqueta.\n\nDuplo clique: editar texto\nAlças roxas: redimensionar\nCtrl+V: colar imagem\nDelete: excluir selecionado",
+            text="Arraste a ferramenta para a etiqueta.\n\nDuplo clique: editar texto\nAlças laterais: largura\nAlças superior/inferior: altura\nCtrl+V: colar imagem\nDelete: excluir selecionado",
             justify="left", bg=SURFACE, fg=MUTED, font=("Segoe UI", 8),
         ).pack(anchor="w", padx=18, pady=18)
         tk.Label(painel_conteudo, text="Fonte fixa\nArial Black", justify="left", bg=SURFACE, fg=TEXT, font=("Arial Black", 11)).pack(side="bottom", anchor="w", padx=18, pady=18)
@@ -1194,7 +1502,7 @@ class EtiquetasView(BaseView):
         self.fantasma_texto = tk.Toplevel(self)
         self.fantasma_texto.overrideredirect(True)
         self.fantasma_texto.attributes("-topmost", True)
-        tk.Label(self.fantasma_texto, text="T  Texto", bg=PRIMARY, fg=TEXT, font=("Segoe UI Semibold", 10), padx=12, pady=7).pack()
+        tk.Label(self.fantasma_texto, text="T  Texto", bg=PRIMARY, fg=ON_PRIMARY, font=("Segoe UI Semibold", 10), padx=12, pady=7).pack()
         self._mover_ferramenta_texto(event)
 
     def _mover_ferramenta_texto(self, event):
@@ -1216,10 +1524,15 @@ class EtiquetasView(BaseView):
             self.fantasma_texto = None
 
     def _adicionar_texto(self, x, y):
-        texto = simpledialog.askstring("Adicionar texto", "Digite o texto da etiqueta:", parent=self)
-        if texto is None or not texto.strip():
+        dialogo = TextoEtiquetaDialog(self, "Adicionar texto")
+        self.wait_window(dialogo)
+        if dialogo.resultado is None:
             return
-        self.elementos.append({"tipo": "texto", "x": x, "y": y, "texto": texto.strip(), "tamanho": 28})
+        self.elementos.append({
+            "tipo": "texto", "x": x, "y": y,
+            "texto": dialogo.resultado["texto"], "tamanho": dialogo.resultado["tamanho"],
+            "escala_x": 1.0, "escala_y": 1.0,
+        })
         self.selecionado = len(self.elementos) - 1
         self._atualizar_previa()
 
@@ -1229,9 +1542,11 @@ class EtiquetasView(BaseView):
         if indice is None or self.elementos[indice]["tipo"] != "texto":
             return
         elemento = self.elementos[indice]
-        texto = simpledialog.askstring("Editar texto", "Altere o texto da etiqueta:", initialvalue=elemento["texto"], parent=self)
-        if texto is not None and texto.strip():
-            elemento["texto"] = texto.strip()
+        dialogo = TextoEtiquetaDialog(self, "Editar texto", elemento["texto"], elemento["tamanho"])
+        self.wait_window(dialogo)
+        if dialogo.resultado is not None:
+            elemento["texto"] = dialogo.resultado["texto"]
+            elemento["tamanho"] = dialogo.resultado["tamanho"]
             self.selecionado = indice
             self._atualizar_previa()
 
@@ -1295,8 +1610,7 @@ class EtiquetasView(BaseView):
             meia_largura = elemento["largura"] / 2
             meia_altura = elemento["altura"] / 2
             return (elemento["x"] - meia_largura, elemento["y"] - meia_altura, elemento["x"] + meia_largura, elemento["y"] + meia_altura)
-        caixa = fonte_arial_black(elemento["tamanho"]).getbbox(elemento["texto"])
-        largura, altura = caixa[2] - caixa[0], caixa[3] - caixa[1]
+        largura, altura = dimensoes_texto_etiqueta(elemento)[:2]
         return (elemento["x"] - largura / 2, elemento["y"] - altura / 2, elemento["x"] + largura / 2, elemento["y"] + altura / 2)
 
     def _atualizar_previa(self):
@@ -1311,9 +1625,9 @@ class EtiquetasView(BaseView):
             escala_x = self.LARGURA_PREVIA / LABEL_WIDTH_PX
             escala_y = self.ALTURA_PREVIA / LABEL_HEIGHT_PX
             caixa = (x1 * escala_x, y1 * escala_y, x2 * escala_x, y2 * escala_y)
-            self.canvas.create_rectangle(*caixa, outline="#7C3AED", width=2, dash=(4, 2))
-            for x, y in self._alcas_selecao(caixa):
-                self.canvas.create_rectangle(x - 5, y - 5, x + 5, y + 5, fill="#7C3AED", outline="white", width=1)
+            self.canvas.create_rectangle(*caixa, outline=HANDLE, width=2, dash=(4, 2))
+            for _nome, x, y in self._alcas_selecao(caixa):
+                self.canvas.create_rectangle(x - 5, y - 5, x + 5, y + 5, fill=HANDLE, outline="white", width=1)
 
     def _ponto_modelo(self, event):
         return (event.x * LABEL_WIDTH_PX / self.LARGURA_PREVIA, event.y * LABEL_HEIGHT_PX / self.ALTURA_PREVIA)
@@ -1321,7 +1635,13 @@ class EtiquetasView(BaseView):
     @staticmethod
     def _alcas_selecao(caixa):
         x1, y1, x2, y2 = caixa
-        return ((x1, y1), (x2, y1), (x1, y2), (x2, y2))
+        meio_x = (x1 + x2) / 2
+        meio_y = (y1 + y2) / 2
+        return (
+            ("nw", x1, y1), ("n", meio_x, y1), ("ne", x2, y1),
+            ("e", x2, meio_y), ("se", x2, y2), ("s", meio_x, y2),
+            ("sw", x1, y2), ("w", x1, meio_y),
+        )
 
     def _caixa_selecao_canvas(self):
         if self.selecionado is None or self.selecionado >= len(self.elementos):
@@ -1338,9 +1658,9 @@ class EtiquetasView(BaseView):
         caixa = self._caixa_selecao_canvas()
         if caixa is None:
             return None
-        for indice, (alca_x, alca_y) in enumerate(self._alcas_selecao(caixa)):
+        for nome, alca_x, alca_y in self._alcas_selecao(caixa):
             if abs(x - alca_x) <= 9 and abs(y - alca_y) <= 9:
-                return indice
+                return nome
         return None
 
     def _elemento_no_ponto(self, x, y):
@@ -1351,7 +1671,14 @@ class EtiquetasView(BaseView):
         return None
 
     def _atualizar_cursor(self, event):
-        if self._alca_no_ponto(event.x, event.y) is not None:
+        alca = self._alca_no_ponto(event.x, event.y)
+        if alca in ("e", "w"):
+            self.canvas.configure(cursor="sb_h_double_arrow")
+            return
+        if alca in ("n", "s"):
+            self.canvas.configure(cursor="sb_v_double_arrow")
+            return
+        if alca is not None:
             self.canvas.configure(cursor="sizing")
             return
         x, y = self._ponto_modelo(event)
@@ -1363,12 +1690,16 @@ class EtiquetasView(BaseView):
         alca = self._alca_no_ponto(event.x, event.y)
         if alca is not None and self.selecionado is not None:
             elemento = self.elementos[self.selecionado]
-            distancia = max(1, math.hypot(x - elemento["x"], y - elemento["y"]))
+            x1, y1, x2, y2 = self._caixa_elemento(elemento)
             self.dados_redimensionamento = {
-                "distancia": distancia,
+                "alca": alca,
+                "meia_largura": max(1, (x2 - x1) / 2),
+                "meia_altura": max(1, (y2 - y1) / 2),
                 "tamanho": elemento.get("tamanho"),
                 "largura": elemento.get("largura"),
                 "altura": elemento.get("altura"),
+                "escala_x": float(elemento.get("escala_x", 1.0)),
+                "escala_y": float(elemento.get("escala_y", 1.0)),
             }
             self.modo_arraste = "redimensionar"
         else:
@@ -1383,13 +1714,22 @@ class EtiquetasView(BaseView):
         x, y = self._ponto_modelo(event)
         elemento = self.elementos[self.selecionado]
         if self.modo_arraste == "redimensionar":
-            distancia = max(1, math.hypot(x - elemento["x"], y - elemento["y"]))
-            fator = distancia / self.dados_redimensionamento["distancia"]
+            dados = self.dados_redimensionamento
+            alca = dados["alca"]
+            altera_largura = alca in ("nw", "ne", "e", "se", "sw", "w")
+            altera_altura = alca in ("nw", "n", "ne", "se", "s", "sw")
+            fator_x = max(0.05, abs(x - elemento["x"]) / dados["meia_largura"])
+            fator_y = max(0.05, abs(y - elemento["y"]) / dados["meia_altura"])
             if elemento["tipo"] == "texto":
-                elemento["tamanho"] = max(8, min(160, round(self.dados_redimensionamento["tamanho"] * fator)))
+                if altera_largura:
+                    elemento["escala_x"] = max(0.2, min(8.0, dados["escala_x"] * fator_x))
+                if altera_altura:
+                    elemento["escala_y"] = max(0.2, min(8.0, dados["escala_y"] * fator_y))
             else:
-                elemento["largura"] = max(20, min(LABEL_WIDTH_PX, round(self.dados_redimensionamento["largura"] * fator)))
-                elemento["altura"] = max(20, min(LABEL_HEIGHT_PX, round(self.dados_redimensionamento["altura"] * fator)))
+                if altera_largura:
+                    elemento["largura"] = max(20, min(LABEL_WIDTH_PX, round(dados["largura"] * fator_x)))
+                if altera_altura:
+                    elemento["altura"] = max(20, min(LABEL_HEIGHT_PX, round(dados["altura"] * fator_y)))
         else:
             anterior_x, anterior_y = self.ultimo_ponto
             elemento["x"] = max(0, min(LABEL_WIDTH_PX, elemento["x"] + x - anterior_x))

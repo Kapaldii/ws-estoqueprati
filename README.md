@@ -4,6 +4,7 @@ Aplicação desktop local para gestão de estoque farmacêutico, desenvolvida em
 
 ## Executar
 
+- Compatível com **Windows 10 e Windows 11 de 64 bits**.
 - Dê duplo clique em `Prati_WMS.exe`; não é necessário instalar nem executar como administrador.
 - Para executar pelo código-fonte, use `python app.py`.
 - O banco `estoque_medicamentos.db` fica na mesma pasta da aplicação.
@@ -15,6 +16,8 @@ Aplicação desktop local para gestão de estoque farmacêutico, desenvolvida em
 - **Cadastrar:** inclusão de itens em posições livres, sem campos de movimentação.
 - **Histórico:** movimentações dos últimos 2 dias, com exportação CSV.
 - **Etiquetas:** editor Zebra SAMPLE horizontal 6×4 para texto em Arial Black ou imagem colada, com impressão pelo driver do Windows.
+
+O botão no canto superior direito alterna entre os modos **Claro** e **Escuro**. A escolha fica salva neste dispositivo e é aplicada na próxima abertura.
 
 Os únicos status disponíveis são `Normal` e `Bloqueado`.
 
@@ -46,18 +49,22 @@ Na aba **Cadastrar**, use **Importar Excel** e selecione um arquivo `.xlsx`. A p
 ## Gerar o executável
 
 ```powershell
-pyinstaller --clean --onefile --noconsole --name "Prati_WMS" app.py
+python -m pip install --requirement requirements-build.txt
+.\build_windows.ps1
 ```
 
-O executável portátil é gerado na pasta `dist`.
+O script exige Python 3.12 de 64 bits, usa versões fixas das dependências, incorpora o manifesto de compatibilidade do Windows e atualiza o pacote portátil sem substituir os bancos. Para instalar automaticamente as dependências, use `.\build_windows.ps1 -InstalarDependencias`.
 
 Para levar a outro computador, copie `Prati_WMS.exe` e `estoque_medicamentos.db` para a mesma pasta. Não coloque o programa em `Program Files`; use uma pasta dentro de `Documentos` para que o banco possa ser atualizado sem permissão de administrador.
+
+O executável possui manifesto `asInvoker`: ele usa as permissões do usuário atual e não solicita elevação. A instalação do driver de uma impressora, quando necessária, é uma operação separada do Windows e pode pedir credenciais administrativas.
 
 ## Etiquetas e impressão
 
 - Formato fixo horizontal: `152,4 × 101,6 mm` (6×4 polegadas), renderizado em `203 dpi` (`1218 × 812` pontos).
-- Arraste **Adicionar texto** da barra lateral até a etiqueta; o conteúdo é solicitado após soltar.
-- O texto usa sempre Arial Black. Arraste as alças roxas para alterar o tamanho diretamente com o cursor e use duplo clique para editar o conteúdo.
+- Arraste **Adicionar texto** da barra lateral até a etiqueta; uma janela ampla permite escrever várias linhas e escolher o tamanho da fonte.
+- O texto usa sempre Arial Black. As alças laterais alteram a largura, as alças superior/inferior alteram a altura e as alças dos cantos alteram as duas dimensões.
+- Use duplo clique sobre um texto para reabrir a janela de conteúdo e tamanho da fonte.
 - Imagens são coladas exclusivamente com `Ctrl+V`, sem botão dedicado.
 - Os elementos podem ser selecionados, movidos com o cursor e excluídos com `Delete`.
 - Modelos são abertos e salvos no formato `.prati-etiqueta`.
